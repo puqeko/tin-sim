@@ -9,6 +9,6 @@ CC = g++-9 -std=c++17 -Wall
 # compiler flags
 FLAGS = -I$(SSPATH)/include -L$(SSPATH)/lib -lumfpack -lamd -lcholmod -lsuitesparseconfig -lm
 
-all: update
-update: update.cpp
-	$(CC) -o update.o update.cpp $(FLAGS)
+all: make_symmetric
+make_symmetric: make_symmetric.cpp
+	$(CC) -o make_symmetric.o make_symmetric.cpp $(FLAGS)
