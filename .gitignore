@@ -1,0 +1,5 @@
+/matrices/*
+!/matrices/simple.mtx
+*.out
+*.o
+.vscode/
