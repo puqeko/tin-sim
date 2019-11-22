@@ -57,5 +57,6 @@ int main ()
     std::cerr << "Sent to stdout.\n";
 
     cholmod_free_sparse(&Ain, &c);
+    cholmod_free_sparse(&A, &c);
     cholmod_finish(&c);
 }
