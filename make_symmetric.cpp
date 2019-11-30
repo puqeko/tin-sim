@@ -48,6 +48,7 @@ int main ()
     }
 
     std::cerr << "Great, this matrix is positive-definate-symmetric.\n";
+    std::cerr << "Storing as triangular matrix.\n";
 
     // create new matrix A that stores lower triangular values only
     // value 1 means use values mode
