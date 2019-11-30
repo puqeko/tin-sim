@@ -12,66 +12,35 @@
  */
 
 #include <iostream>
-#include <fstream>
+
+#include <cholmod.h>
+#include <stdint.h>
+
 #include <string>
 #include <vector>
 #include <unordered_set>
-#include <cholmod.h>
-#include <stdint.h>
 
 #define LOWER_TRIANGULAR -1
 #define UPPER_TRIANGULAR 1
 
-/**
- * Assume all groups are connected.
- * */
-int read_mtx_file(std::string filename, size_t n_nodes)
-{
-    // allocate our adjacency list
-    // [
-    //     group n_0: [(n_1, g_1), (n_2, g_2), ...]
-    // ]
-    // such that group n_0 connects to n_1 with conductance g_1 etc
-    adj_list adj(n_nodes);
-    std::ifstream file;
-    file.open(filename);
 
-    if (!file.is_open()) {
-        std::cerr << "Could not open '" << filename << "'.\n";
-        return -1; 
-    }
-
-    // look for header of form '%%MatrixMarket
-    std::string line; 
-    while (std::getline(file, line))
-    {
-
-    }
-
-    file.close();
-}
-
-static cholmod_common common;
+static cholmod_common g_common;
 
 /**
- * Create common object needed for cholmod settings which are used by pretty
- * much all cholmod functions. 'common' is a global of this module and must
+ * Create g_common object needed for cholmod settings which are used by pretty
+ * much all cholmod functions. 'g_common' is a global of this module and must
  * be initalised before any other call to cholmod.
  * */
 void initalise_cholmod()
 {
-    cholmod_start(&common);
+    cholmod_start(&g_common);
 
     // use lower triangular in the default case when storing sparse matrices.
-    common.prefer_upper = false;
+    g_common.prefer_upper = false;
 }
 
-/**
- * Construct and preorder a sparse conductance matrix.
- * Uses CHOLMOD's preording techniques based on graph structure and the
- * input groups.
- * */
-cholmod_triplet* triplets_from_file
+
+cholmod_triplet* triplet_from_file
 (
     // the filename to read from, as a string
     const std::string &filename
@@ -79,26 +48,41 @@ cholmod_triplet* triplets_from_file
 {
     // read file into triplet form
     FILE *file = fopen(filename.c_str, "r");
-    cholmod_triplet* conductance_coords = cholmod_read_triplet(file, &common);
+    cholmod_triplet* conductance_coords = cholmod_read_triplet(file, &g_common);
 
     if (conductance_coords->ncol != conductance_coords->nrow) {
         std::cerr << "Must be a sqaure matrix.\n";
-        cholmod_free_triplet(&conductance_coords, &common);
+        cholmod_free_triplet(&conductance_coords, &g_common);
         return NULL;
     }
 
     return conductance_coords;
 }
 
+// when we construct the matrix, we remove some rows which means that the
+// ith group may not corrispond to the ith row in the matrix anymore. Hence,
+// j = g_input_groups[i] tells us that group i is row j in the matrix.
+static std::vector<int> g_group_to_mat_map;
+static std::vector<int> g_mat_to_group_map;
+
+// outputs
+// the sparse conductance matrix, or the A matrix
+static cholmod_sparse* g_A;
+// the injected currents, or the b vector
+static cholmod_sparse* g_b;
+
 /**
- * Get the A matrix and b vector from a triplet.
+ * Compute the A matrix and b vector from a triplet and input vector.
+ * 
+ * This is prep for solving Ax = b, where x is a vector of group voltages and b
+ * is a vector of injected currents.
  * 
  * The input triplet is a list where each entry is a coordinate between two
  * groups and the conductance of that connection. The input triplet is expected
- * to be symmetric (ie only specify entries where row > col) and specify NO
+ * to be symmetric, only specify entries where row > col, and to specify NO
  * self conductance (ie no conduntance between the same group a->a). The network
  * must also be fully connected - ie have only a single component which consists
- * of more than one group.
+ * of more than one group. Some of these groups will be input groups.
  * 
  * The A matrix is a conductance matrix, stored as a sparse matrix in
  * compressed column form. All rows/columns corrisponding to input voltages
@@ -107,41 +91,54 @@ cholmod_triplet* triplets_from_file
  * 
  * The b vector is a vector of injected currents such that the input voltages
  * are maintained at the specified groups. If no input voltages are specified,
- * the system has the trivial solution (b = 0). If only one input voltage is
- * specified, then the system has the solution b = a, where a is the specified
- * input voltage at some group. Hence, input voltages should be at-least 2.
+ * the system has the trivial solution (x = 0). If only one input voltage is
+ * specified, then the system has the solution x = a, where a is some voltage.
+ * Hence, the number of input groups should be at-least 2.
  * 
- * @param triplet: a cholmod_triplet describing the network (this will get freed)
+ * About 2*nnz + 3*nrows memory is needed, where nnz is the number of non-zero
+ * entries (excluding globals)
+ * 
+ * @param triplet: a cholmod_triplet describing the network (this will get freed!)
  * @param input_groups: a vector of groups which have a known voltage
  * 
- * outputs:
- * @param A_out: the sparse A matrix
- * @param b_out: the sparse b matrix
  * @returns: 0 on success, error otherwise
  * */
-int system_from_triplet
+int build_system_from_network
 (
-    // a list of connections between groups and their conductances
-    // this triplet will be freed
-    const cholmod_triplet *triplet,
-    // groups that we know the voltage of
-    const std::vector<int> &input_groups,
-
-    // outputs
-    // the sparse conductance matrix, or the A matrix
-    cholmod_sparse* A_out,
-    // the injected currents, or the b vector
-    cholmod_sparse* b_out
+    // a list of connections between groups and their conductances, there are
+    // helper function to help construct this object. This triplet will be freed
+    cholmod_triplet *triplet,
+    // the indices of groups that we will know the voltage of (ie group number)
+    const std::vector<int> &input_groups
 )
 {
+    if (input_groups.size() == 0)
+    {
+        std::cerr << "Must call set_input_groups(...) first.\n";
+        return -1;
+    }
+
     // see main comment above
     if (input_groups.size() < 2) {
-        std::cerr << "Warning: You should specify more than two input voltages."
+        std::cerr << "Warning: You should specify more than two input voltages. "
                      "The system isn't going to be very interesting otherwise.\n";
+        // still do it though
+    }
+
+    // make some assertions about symmetry, type, etc of triplet
+    if (triplet->ncol != triplet->nrow || triplet->xtype != CHOLMOD_DOUBLE ||
+        triplet->stype != LOWER_TRIANGULAR) {
+        std::cerr << "Triplet must be symmetric, lower triangular, and of type"
+                     " float.\n";
+        return -1;
     }
 
     // make set of input groups for fast O(1) lookup
     std::unordered_set<int> input_node_lookup (input_groups.begin(), input_groups.end());
+
+    // map from group index to matrix index
+    g_group_to_mat_map = std::vector<int>(triplet->nrow);
+    g_mat_to_group_map = std::vector<int>(triplet->nrow);
 
     // build new triplet to construct a conductance matrix A
     // assuming lower triangular form (row > col) with no diagonal entries, then
@@ -150,22 +147,22 @@ int system_from_triplet
 
     // allocate space to store our now coordinates
     // use the nnz + extra diagonal entries as a starting estimate for the memory
-    // we need. It will be less than this since we remove some entries, but
-    // we can get std vector to do the resizing.
+    // we need. It will be less than this since we remove some entries.
     int len_est = triplet->nnz + triplet->nrow;
-    int *i_row = new int[len_est]; // row coordinates
-    int *i_col = new int[len_est]; // column coordinates
-    double *g = new double[len_est];  // conductance value
+
+    cholmod_triplet* new_triplet;
+    new_triplet = cholmod_allocate_triplet(triplet->nrow, triplet->nrow, len_est,
+                                           LOWER_TRIANGULAR, CHOLMOD_DOUBLE, &g_common);
 
     // total self conductance (diagonal entries)
     double *g_total = new double[triplet->nrow];
+    double *b_temp = new double[triplet->nrow];  // b vector
+    // By kirchoffs current law, the sum of currents in/out of a group is zero
+    // assuming no injected current.
+    for (int i = 0; i < triplet->nnz; i++) b_temp[i] = 0;
 
-    double *b = new double[triplet->nnz];  // b vector
-
-    // TODO: make some assertions about symmetry, type, etc
-
-    int i = 0;
-    for (; i < triplet->nnz; i++) {
+    int t = 0;  // the current index in the new_triplet
+    for (int i = 0; i < triplet->nnz; i++) {
         // get row, col coords and conductance value of current triple
         const int &ri = ((int*)triplet->i)[i];
         const int &ci = ((int*)triplet->j)[i];
@@ -180,32 +177,68 @@ int system_from_triplet
         // adjust b matrix, ie our injected currents, accordingly.
         // Remember, the only the lower triangular tripples are given.
         if (input_node_lookup.count(ri)) {
-            b[ci] += gi;  // move -gi (upper triangular term) to other side
+            b_temp[ci] += gi;  // move -gi (upper triangular term) to other side
         } else if (input_node_lookup.count(ci)) {
-            b[ri] += gi;  // move -gi (lower triangular term) to other side
+            b_temp[ri] += gi;  // move -gi (lower triangular term) to other side
         } else {
             // this isn't a known input row/col
-            i_row[i] = ri;
-            i_col[i] = ci;
-            g[i] = -gi;  // -ive off diagonals
+            ((int*)new_triplet->i)[t] = ri;
+            ((int*)new_triplet->j)[t] = ci;
+            ((double*)new_triplet->x)[t] = -gi;  // -ive off diagonals
+            t++;  // this will lag behind i
         }
     }
 
     // add diagonal self conductance entries
-    int j = 0;
-    for (; j < triplet->nrow; j++, i++) {
+    for (int j = 0; j < new_triplet->nrow; j++) {
         if (!input_node_lookup.count(j)) {
             // ignoring input nodes
-            i_row[i] = j;
-            i_col[i] = j;
-            g[i] = g_total[j];
+            ((int*)new_triplet->i)[t] = j;
+            ((int*)new_triplet->j)[t] = j;
+            ((double*)new_triplet->x)[t] = g_total[j];
+
+            // map between matrix coords and actual group indices
+            g_group_to_mat_map[j] = t;
+            g_mat_to_group_map[t] = j;
+            t++;
         }
     }
+    cholmod_free_triplet(&triplet, &g_common);
+    delete g_total;
+    // resize now that we know exactly how big new_triplet is
+    cholmod_reallocate_triplet(t, new_triplet, &g_common);
 
-    cholmod
+    // convert A to sparse
+    cholmod_sparse *A;
+    A = cholmod_triplet_to_sparse(new_triplet, new_triplet->nnz, &g_common);
+    cholmod_free_triplet(&new_triplet, &g_common);
+    g_A = A;  // save pointer to global
 
-    cholmod_sparse *A = cholmod_triplet_to_sparse(new_triplet, new_triplet->nnz, &common);
-    
+    // convert b to sparse
+    cholmod_triplet *b_triplet;
+    b_triplet = cholmod_allocate_triplet(new_triplet->nrow, new_triplet->nrow,
+                                         new_triplet->nrow, 0, CHOLMOD_DOUBLE, &g_common);
+
+    // populate with non-zero b entries
+    int u = 0;  // b_triplet index
+    for (int k = 0; k < b_triplet->nrow; k++) {
+        if (b_temp[k] != 0.0) {
+            ((int*)b_triplet->i)[u] = k;
+            ((int*)b_triplet->j)[u] = 1;  // only one column
+            ((double*)b_triplet->x)[u] = b_temp[k];
+            u++;
+        }
+    }
+    cholmod_reallocate_triplet(u, b_triplet, &g_common);  // shrink to right size
+    delete b_temp;
+
+    // convert b to sparse
+    // we do this not because it saves memory, but because it reduces the
+    // number of computations required every time we multiply an element of b.
+    cholmod_sparse *b;
+    b = cholmod_triplet_to_sparse(b_triplet, u, &g_common);
+    cholmod_free_triplet(&b_triplet, &g_common);
+    g_b = b;  // save to global
 
     return 0;
 }
@@ -216,14 +249,14 @@ int main ()
 {
     cholmod_sparse *Ain, *A;
 
-    cholmod_start(&c);
-    Ain = cholmod_read_sparse(stdin, &c);
+    initalise_cholmod();
+    Ain = cholmod_read_sparse(stdin, &g_common);
 
     // is this matrix already valid?
     if (Ain->stype != LOWER_TRIANGULAR) {
         std::cerr << "This matrix is not in lower triangular form. Use make_symmetric.\n";
-        cholmod_free_sparse(&Ain, &c);
-        cholmod_finish(&c);
+        cholmod_free_sparse(&Ain, &g_common);
+        cholmod_finish(&g_common);
         return 0;
     }
 
