@@ -240,6 +240,7 @@ int build_system_from_network
     cholmod_free_triplet(&b_triplet, &g_common);
     g_b = b;  // save to global
 
+    // TODO: return object containing relevant stuff.
     return 0;
 }
 
