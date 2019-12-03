@@ -53,6 +53,8 @@ typedef struct {
     cholmod_dense *e_handle;
 } solver_state_t;
 
+
+
 /**
  * Allocate memory for a state object needed for cholmod operations, configure,
  * and allow chomod to initalise itself (clears pointers, stats, default params).
@@ -99,17 +101,14 @@ void solver_destroy_state(solver_state_t* state)
 }
 
 
-// used in solver_initalise_network to sort triplet entries by row then by
-// column. https://linux.die.net/man/3/qsort
-int _triplet_sort_comparitor(const void *left, const void *right, void *arg)
+// Used in insertion sort for triplets to return row followed by column ordering
+// Returns -1 if left < right, 1 if left > right, else 0
+int _triplet_comparitor(cholmod_triplet *triplet, const int l, const int r)
 {
     // sort out the types of our inputs
     // the reason this code looks like cancer is because we must cast all the
     // void pointers to types so that c knows how to deal with them
     // this happens for triplet properties and for this function's arguments
-    cholmod_triplet *triplet = (cholmod_triplet*)(arg);
-    const int l = *((const int*)(left));
-    const int r = *((const int*)(right));
 
     if (((int*)triplet->j)[l] < ((int*)triplet->j)[r]) return -1;
     else if (((int*)triplet->j)[l] > ((int*)triplet->j)[r]) return 1;
@@ -119,6 +118,40 @@ int _triplet_sort_comparitor(const void *left, const void *right, void *arg)
         else if (((int*)triplet->i)[l] > ((int*)triplet->i)[r]) return 1;
     }
     return 0;  // default
+}
+
+
+/**
+ * Three way insertion sort for sorting triplets by row then column.
+ * 
+ * Since I assume that the indicies will be some what in the correct order, or
+ * prehaps even already ordered, using insertion sort isn't so bad. In most cases
+ * we are O(n) time with O(1) extra memory. O(n^2) worst case time.
+ * */
+void sort_triplet(cholmod_triplet* triplet)
+{
+    // start with the first item 'sorted' then find a place to put the item at
+    // position next.
+    for (int next = 1; next < triplet->nnz; next++) {
+        printf("next: %d\n", next);
+        for (int i = next - 1; i >= 0; i--) {
+            printf("%d\n", i);
+            if (_triplet_comparitor(triplet, i, i+1) > 0) {
+                int tempi = ((int*)triplet->i)[i];
+                int tempj = ((int*)triplet->j)[i];
+                double tempx = ((double*)triplet->x)[i];
+
+                ((int*)triplet->i)[i] = ((int*)triplet->i)[i+1];
+                ((int*)triplet->j)[i] = ((int*)triplet->j)[i+1];
+                ((double*)triplet->x)[i] = ((double*)triplet->x)[i+1];
+
+                ((int*)triplet->i)[i+1] = tempi;
+                ((int*)triplet->j)[i+1] = tempj;
+                ((double*)triplet->x)[i+1] = tempx;
+            }
+            else break;  // otherwise, these are sorted so move to next one
+        }
+    }
 }
 
 /**
@@ -214,30 +247,8 @@ int solver_initalise_network
     //     n_groups, n_groups, triplet->nnz + n_groups, true, true,
     //     LOWER_TRIANGULAR, CHOLMOD_REAL, state->common);
 
-    // We need to make sure the triplets are sorted.
-    // Since we don't have a function which can sort three lists at once, we
-    // sort a list of indices then use these indicies to form new lists which
-    // are in sorted order.
-    int *itemp = malloc(triplet->nnz * sizeof(int));
-    for (int i = 0; i < triplet->nnz; i++) itemp[i] = i;
-
-    // for (int i = 0; i < triplet->nnz; i++) {
-    //     printf("%d\n", itemp[i]);
-    // }
-    // printf("\n");
-
-    // copy accross values according to indicies
-    int *jtemp = malloc(triplet->nnz * sizeof(int));
-    int *xtemp = malloc(triplet->nnz * sizeof(int));
-
-    // 
-    sort_r(itemp, triplet->nnz, sizeof(int), _triplet_sort_comparitor, triplet);
-
-    for (int i = 0; i < triplet->nnz; i++) {
-        printf("%d\n", itemp[i]);
-    }
-    printf("\n");
-
+    // make sure triplet is sorted by row then column in accending order
+    sort_triplet(triplet);
     return 0;
 }
 
@@ -448,6 +459,7 @@ cholmod_triplet* triplet_from_file
 
 // https://stackoverflow.com/questions/2744181/how-to-call-c-function-from-c
 
+
 #define TRIPLET_DEBUG_LIMIT 10
 void print_triplet(solver_state_t* state, cholmod_triplet* triplet)
 {
@@ -468,6 +480,7 @@ void print_triplet(solver_state_t* state, cholmod_triplet* triplet)
     if (n_print < triplet->nnz) printf("...\n\n");
     else printf("\n");
 }
+
 
 // Load a real simple example matrix and solve.
 // We're using the folloiwng a 4x4 conductance matrix. The interconductances
