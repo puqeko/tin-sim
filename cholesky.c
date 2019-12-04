@@ -44,8 +44,8 @@ typedef struct {
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
     cholmod_sparse *A;  // the full conductance matrix
     cholmod_factor *LD;  // the LD decomposition
-    cholmod_dense *g;  // vector of conductances on right-hand-side
-    cholmod_dense *b;  // vector of injected currents b = g x [known voltages]
+    cholmod_sparse *G;  // matrix of conductances on the right-hand-side
+    cholmod_dense *b;  // vector of injected currents b = G v [known voltages]
     cholmod_sparse *b_set;  // pattern of groups which have injected currents
     cholmod_dense *x;  // vector of solved voltages
     cholmod_sparse *x_set;  // pattern of groups voltages with defined solutions
@@ -89,7 +89,7 @@ void solver_destroy_state(solver_state_t* state)
     if (state->mat_to_group_map) free(state->mat_to_group_map);
     if (state->A) cholmod_free_sparse(&state->A, state->common);
     if (state->LD) cholmod_free_factor(&state->LD, state->common);
-    if (state->g) cholmod_free_dense(&state->b, state->common);
+    if (state->G) cholmod_free_dense(&state->G, state->common);
     if (state->b) cholmod_free_dense(&state->b, state->common);
     if (state->b_set) cholmod_free_sparse(&state->b_set, state->common);
     if (state->x) cholmod_free_dense(&state->x, state->common);
@@ -258,7 +258,6 @@ int solver_initalise_network
     state->group_to_mat_map = malloc(n_groups * sizeof(int));
     state->mat_to_group_map = malloc(n_mat * sizeof(int));
 
-    printf("map: ");
     int ig = 0;  // current group index
     int i = 0;  // current matrix index
     for (; ig < n_groups; ig++) {
@@ -271,10 +270,7 @@ int solver_initalise_network
             state->mat_to_group_map[i] = ig;
             i++;  // next matrix index
         }
-
-        printf("%d ", state->group_to_mat_map[ig]);
     }
-    printf("\n");
 
     // the empty matrix we are going to fill
     cholmod_sparse* A = cholmod_allocate_sparse(
@@ -283,12 +279,22 @@ int solver_initalise_network
 
     state->A = A;  // save a reference in state
 
+    // The transpose of G, so that we can store in compressed column form then
+    // do a transpose. This matrix is unsymmetric
+    cholmod_sparse* Gt = cholmod_allocate_sparse(
+        n_groups, n_input_groups, triplet->nnz, true, true, 0, CHOLMOD_REAL, state->common);
+    
+    // state->G = G;
+
     // count the total conductance into each node (the diagonal elements)
     double *temp_total_g = calloc(n_groups, sizeof(double));
 
     // fill in reduce column form
-    int it = 0;  // current triplet value
-    int ix = 0;  // current matrix value
+    int it = 0;  // current triplet value index
+    int ix = 0;  // current A matrix value index
+    int ixx = 0;  // current G matrix value index
+
+    int in = 0;  // current input group index
     ig = 0;  // current group index
     i = 0;  // current matrix index
     size_t nz = triplet->nnz;
@@ -296,6 +302,8 @@ int solver_initalise_network
     for (; ig < n_groups; ig++) {
         // use inputs for sum but don't add to sparse matrix A
         if (state->is_input[ig]) {
+            ((int*)Gt->p)[i] = ixx;  // pointer to column start
+            
             while (it < nz && ((int*)triplet->j)[it] == ig) {
                 // while the conductances are still on this row
                 // get the column index
@@ -307,10 +315,17 @@ int solver_initalise_network
                 temp_total_g[ig] += g;
                 temp_total_g[ir] += g;
 
+                // add row indices which still have an impact on the rhs
+                ((double*)Gt->x)[ixx] = g;  // add to right-hand-side
+                ((int*)Gt->i)[ixx] = ir;  // row index in column
+                ixx++;
+
                 // move to next triplet
                 it++;
             }
 
+            // move to next input group
+            in++;
         } else {
             // otherwise, this group is an unknown and should be added to A
             ((int*)A->p)[i] = ix;  // pointer to column start
@@ -328,10 +343,9 @@ int solver_initalise_network
                 int ir = ((int*)triplet->i)[it];
                 double g = ((double*)triplet->x)[it];  // conductance
 
+                // sum at both indicies since matrix is symmetric (off diagonals repeat)
                 temp_total_g[ig] += g;
                 temp_total_g[ir] += g;
-
-                printf("(%d %d %d)\n", i, ir, ix);
 
                 if (!state->is_input[ir]) {
                     // save matrix value
@@ -348,14 +362,9 @@ int solver_initalise_network
             i++;
         }
     }
-    // ie, the number of nonzeros
-    // the array A->p is of length [n columns] + 1
+    // the number of nonzeros
+    // the array A->p is of length [n columns] + 1 where the last is nnz
     int nnz = ((int*)A->p)[i] = ix;
-
-    for (i = 0; i < nnz; i++) {
-        printf("%f ", ((double*)A->x)[i]);
-    }
-    printf("\n");
 
     // Fill in diagonal entries with total conductances.
     // Since the diagonal entry is always the first in each column,
@@ -363,31 +372,21 @@ int solver_initalise_network
     for (ig = 0, i = 0; ig < n_groups; ig++) {
         if (!state->is_input[ig]) {
             int p = ((int*)A->p)[i];
-            printf("-%d\n", p);
             ((double*)A->x)[p] = temp_total_g[i];
 
             // increase matrix index [0 ... n_mat-1]
             i++;
         }
     }
-
-    cholmod_print_sparse(A, NULL, state->common);
-    printf("NZ %ld\n", cholmod_nnz(A, state->common));
-
-    for (i = 0; i < n_mat+1; i++) {
-        printf("%d ", ((int*)A->p)[i]);
-    }
-    printf("\n");
-    for (i = 0; i < nnz; i++) {
-        printf("%d ", ((int*)A->i)[i]);
-    }
-    printf("\n");
-    for (i = 0; i < nnz; i++) {
-        printf("%f ", ((double*)A->x)[i]);
-    }
-    printf("\n");
-
     free(temp_total_g);
+    cholmod_reallocate_sparse(nnz, A, state->common);
+
+    // Now calculate our g matrix. We move our known terms to the right-hand-side
+    // so we get A x = 0 + G v = b. Here, 0 is the solution with no injected currents.
+    // We add to this our known terms which are a conductance matrix of knowns times
+    // our known voltages v.
+
+
 
     // TODO: populate state->g
 
