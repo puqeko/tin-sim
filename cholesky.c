@@ -28,6 +28,8 @@ typedef struct {
     // lookup table: is_input[i] is true if group i is an input else it is false
     bool *is_input;
     bool *is_output;  // same as for input, but these are the output nodes
+    int n_groups;  // use int over size_t for consistancy with cholmod
+    int n_mat;
 
     // TODO: test if we can use x to store input voltages + solutions togther
     // or is it not safe?
@@ -36,6 +38,7 @@ typedef struct {
     // a map between a group index and the index in A
     // ie j = group_to_mat_map[i] means that group i is at index j in A
     // we must do this since groups of known voltage are removed from A
+    // in group_to_mat_map, group_to_mat_map[i] == -1 indicates an input group
     int *group_to_mat_map, *mat_to_group_map;
 
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
@@ -101,7 +104,7 @@ void solver_destroy_state(solver_state_t* state)
 }
 
 
-// Used in insertion sort for triplets to return row followed by column ordering
+// Used in insertion sort for triplets to return column followed by row ordering
 // Returns -1 if left < right, 1 if left > right, else 0
 int _triplet_comparitor(cholmod_triplet *triplet, const int l, const int r)
 {
@@ -122,21 +125,24 @@ int _triplet_comparitor(cholmod_triplet *triplet, const int l, const int r)
 
 
 /**
- * Three way insertion sort for sorting triplets by row then column.
+ * Three-way insertion sort for sorting triplets by column then row.
  * 
  * Since I assume that the indicies will be some what in the correct order, or
  * prehaps even already ordered, using insertion sort isn't so bad. In most cases
- * we are O(n) time with O(1) extra memory. O(n^2) worst case time.
+ * we are O(n) time with O(1) extra memory. O(n^2) worst case time though.
+ * 
+ * If this function is becomming a drag, consider quicksort or mergesort.
  * */
 void sort_triplet(cholmod_triplet* triplet)
 {
     // start with the first item 'sorted' then find a place to put the item at
     // position next.
     for (int next = 1; next < triplet->nnz; next++) {
-        printf("next: %d\n", next);
         for (int i = next - 1; i >= 0; i--) {
-            printf("%d\n", i);
             if (_triplet_comparitor(triplet, i, i+1) > 0) {
+
+                // swap the ith and (i+1)th items, but we have to do this for
+                // all three lists (the row/col index and conductance value)
                 int tempi = ((int*)triplet->i)[i];
                 int tempj = ((int*)triplet->j)[i];
                 double tempx = ((double*)triplet->x)[i];
@@ -185,6 +191,9 @@ void sort_triplet(cholmod_triplet* triplet)
  * @param state: where all our data/results are kept
  * @param triplet: a cholmod_triplet describing the network (this will get freed!)
  * @param input_groups: a vector of groups which have a known voltage
+ * @param n_input_groups: number of input groups
+ * @param output_groups: a vector of groups we want to know the voltage of
+ * @param n_output_groups: number of output groups
  * 
  * @returns: 0 on success, error otherwise
  * */
@@ -193,7 +202,7 @@ int solver_initalise_network
     solver_state_t* state,
     // a list of connections between groups and their conductances, there are
     // helper function to help construct this object. This triplet will be freed
-    cholmod_triplet *triplet,
+    cholmod_triplet *triplet,  // Note: will sort the triplets
     const int *input_groups,  // array of indices which are input groups
     const int n_input_groups,  // number of input groups
     const int *output_groups,  // array of indices which are output groups
@@ -223,7 +232,11 @@ int solver_initalise_network
         return -1;
     }
 
-    size_t n_groups = triplet->nrow;  // ie, the total number of groups
+    // make sure triplet is sorted by column then row in increasing order
+    sort_triplet(triplet);
+
+    int n_groups = triplet->nrow;  // ie, the total number of groups
+    state->n_groups = n_groups;
 
     // make set of input and output groups for faster O(1) lookup
     if (!state->is_input)
@@ -238,17 +251,146 @@ int solver_initalise_network
         state->is_output[output_groups[i]] = true;
     }
 
+    int n_mat = triplet->nrow - n_input_groups;  // size of matrix
+    state->n_mat = n_mat;
+
     // map from group index to matrix index
-    state->group_to_mat_map = calloc(n_groups, sizeof(int));
-    state->mat_to_group_map = calloc(n_groups, sizeof(int));
+    state->group_to_mat_map = malloc(n_groups * sizeof(int));
+    state->mat_to_group_map = malloc(n_mat * sizeof(int));
 
-    // lets form the sparse matrix A in compressed column form...
-    // cholmod_sparse* A = cholmod_allocate_sparse(
-    //     n_groups, n_groups, triplet->nnz + n_groups, true, true,
-    //     LOWER_TRIANGULAR, CHOLMOD_REAL, state->common);
+    printf("map: ");
+    int ig = 0;  // current group index
+    int i = 0;  // current matrix index
+    for (; ig < n_groups; ig++) {
+        if (state->is_input[ig]) {
+            // mark as input group
+            state->group_to_mat_map[ig] = -1;
+        } else {
+            // create group mapping from group index to matrix index and visa versa
+            state->group_to_mat_map[ig] = i;
+            state->mat_to_group_map[i] = ig;
+            i++;  // next matrix index
+        }
 
-    // make sure triplet is sorted by row then column in accending order
-    sort_triplet(triplet);
+        printf("%d ", state->group_to_mat_map[ig]);
+    }
+    printf("\n");
+
+    // the empty matrix we are going to fill
+    cholmod_sparse* A = cholmod_allocate_sparse(
+        n_mat, n_mat, triplet->nnz + n_groups, true, true,
+        LOWER_TRIANGULAR, CHOLMOD_REAL, state->common);
+
+    state->A = A;  // save a reference in state
+
+    // count the total conductance into each node (the diagonal elements)
+    double *temp_total_g = calloc(n_groups, sizeof(double));
+
+    // fill in reduce column form
+    int it = 0;  // current triplet value
+    int ix = 0;  // current matrix value
+    ig = 0;  // current group index
+    i = 0;  // current matrix index
+    size_t nz = triplet->nnz;
+
+    for (; ig < n_groups; ig++) {
+        // use inputs for sum but don't add to sparse matrix A
+        if (state->is_input[ig]) {
+            while (it < nz && ((int*)triplet->j)[it] == ig) {
+                // while the conductances are still on this row
+                // get the column index
+                int ir = ((int*)triplet->i)[it];
+                double g = ((double*)triplet->x)[it];  // conductance
+
+                // add to both nodes as matrix is symmetric but given in
+                // lower triangular only
+                temp_total_g[ig] += g;
+                temp_total_g[ir] += g;
+
+                // move to next triplet
+                it++;
+            }
+
+        } else {
+            // otherwise, this group is an unknown and should be added to A
+            ((int*)A->p)[i] = ix;  // pointer to column start
+            ((int*)A->i)[ix] = i;  // row index in column, i since diagonal
+            ((double*)A->x)[ix] = -1;
+
+            // for lower-triangular form, the first entry in each row is the diag
+            // but we wont know it's value until we have totaled them up, so move
+            // to next matrix value
+            ix++;
+
+            while (it < nz && ((int*)triplet->j)[it] == ig) {
+                // while the conductances are still on this row
+                // get the row index
+                int ir = ((int*)triplet->i)[it];
+                double g = ((double*)triplet->x)[it];  // conductance
+
+                temp_total_g[ig] += g;
+                temp_total_g[ir] += g;
+
+                printf("(%d %d %d)\n", i, ir, ix);
+
+                if (!state->is_input[ir]) {
+                    // save matrix value
+                    ((double*)A->x)[ix] = -g;
+                    ((int*)A->i)[ix] = state->group_to_mat_map[ir];  // row index in column
+                    ix++;
+                }
+
+                // move to next triplet
+                it++;
+            }
+
+            // increase matrix index [0 ... n_mat-1]
+            i++;
+        }
+    }
+    // ie, the number of nonzeros
+    // the array A->p is of length [n columns] + 1
+    int nnz = ((int*)A->p)[i] = ix;
+
+    for (i = 0; i < nnz; i++) {
+        printf("%f ", ((double*)A->x)[i]);
+    }
+    printf("\n");
+
+    // Fill in diagonal entries with total conductances.
+    // Since the diagonal entry is always the first in each column,
+    // just use the column pointers directly.
+    for (ig = 0, i = 0; ig < n_groups; ig++) {
+        if (!state->is_input[ig]) {
+            int p = ((int*)A->p)[i];
+            printf("-%d\n", p);
+            ((double*)A->x)[p] = temp_total_g[i];
+
+            // increase matrix index [0 ... n_mat-1]
+            i++;
+        }
+    }
+
+    cholmod_print_sparse(A, NULL, state->common);
+    printf("NZ %ld\n", cholmod_nnz(A, state->common));
+
+    for (i = 0; i < n_mat+1; i++) {
+        printf("%d ", ((int*)A->p)[i]);
+    }
+    printf("\n");
+    for (i = 0; i < nnz; i++) {
+        printf("%d ", ((int*)A->i)[i]);
+    }
+    printf("\n");
+    for (i = 0; i < nnz; i++) {
+        printf("%f ", ((double*)A->x)[i]);
+    }
+    printf("\n");
+
+    free(temp_total_g);
+
+    // TODO: populate state->g
+
     return 0;
 }
 
@@ -271,193 +413,6 @@ cholmod_triplet* triplet_from_file
 
     return conductance_coords;
 }
-
-// /**
-//  * Compute the A matrix and b vector from a triplet and input vector.
-//  * 
-//  * This is prep for solving Ax = b, where x is a vector of group voltages and b
-//  * is a vector of injected currents.
-//  * 
-//  * The input triplet is a list where each entry is a coordinate between two
-//  * groups and the conductance of that connection. The input triplet is expected
-//  * to be symmetric, only specify entries where row > col, and to specify NO
-//  * self conductance (ie no conduntance between the same group a->a). The network
-//  * must also be fully connected - ie have only a single component which consists
-//  * of more than one group. Some of these groups will be input groups.
-//  * 
-//  * The A matrix is a conductance matrix, stored as a sparse matrix in
-//  * compressed column form. All rows/columns corrisponding to input voltages
-//  * are moved to the right-hand-side (the b matrix), since the corrisponding
-//  * voltages are known at each timestep, and removed from A.
-//  * 
-//  * The b vector is a vector of injected currents such that the input voltages
-//  * are maintained at the specified groups. If no input voltages are specified,
-//  * the system has the trivial solution (x = 0). If only one input voltage is
-//  * specified, then the system has the solution x = a, where a is some voltage.
-//  * Hence, the number of input groups should be at-least 2.
-//  * 
-//  * About 2*nnz + 3*nrows memory is needed, where nnz is the number of non-zero
-//  * entries (excluding globals)
-//  * 
-//  * @param state: where all our data/results are kept
-//  * @param triplet: a cholmod_triplet describing the network (this will get freed!)
-//  * @param input_groups: a vector of groups which have a known voltage
-//  * 
-//  * @returns: 0 on success, error otherwise
-//  * */
-// int solver_initalise_network2
-// (
-//     solver_state_t* state,
-//     // a list of connections between groups and their conductances, there are
-//     // helper function to help construct this object. This triplet will be freed
-//     const cholmod_triplet *triplet,
-//     // the indices of groups that we will know the voltage of (ie group number)
-//     const int *input_groups,
-//     const int n_input_groups,
-//     const int *output_groups
-// )
-// {
-//     // TODO: potential optimisation. instead of creating a new_triplet structure and
-//     // converting to a sparse matrix, one could compute the compressed column
-//     // form of the sparse matrix directly by first sorting the entries in
-//     // triplet then adding only the approporate entries to the structure. This
-//     // reduces the amount of copying needed.
-
-//     if (n_input_groups == 0)
-//     {
-//         fprintf(stderr, "Must call set_input_groups(...) first.\n");
-//         return -1;
-//     }
-
-//     // see main comment above
-//     if (n_input_groups < 2) {
-//         fprintf(stderr, "Warning: You should specify more than two input voltages. "
-//                      "The system isn't going to be very interesting otherwise.\n");
-//         // still try it though, just a warning
-//     }
-
-//     // make some assertions about symmetry, type, etc of triplet
-//     if (triplet->ncol != triplet->nrow || triplet->xtype != CHOLMOD_DOUBLE ||
-//         triplet->stype != LOWER_TRIANGULAR) {
-//         fprintf(stderr, "Triplet must be symmetric, lower triangular, and of type"
-//                      " float.\n");
-//         return -1;
-//     }
-
-//     // make set of input groups for faster O(1) lookup
-//     int *input_node_lookup = calloc(triplet->nrow, sizeof(int));
-//     for (int i = 0; i < n_input_groups; i++) {
-//         input_node_lookup[input_groups[i]] = true;
-//     }
-
-//     // map from group index to matrix index
-//     state->group_to_mat_map = calloc(triplet->nrow, sizeof(int));
-//     state->mat_to_group_map = calloc(triplet->nrow, sizeof(int));
-
-//     // build new triplet to construct a conductance matrix A
-//     // assuming lower triangular form (row > col) with no diagonal entries, then
-//     // we must add the self conductance terms to the existing matrix (the diagonls)
-//     // and remove entries corrisponding to know input votlages.
-
-//     // allocate space to store our now coordinates
-//     // use the nnz + extra diagonal entries as a starting estimate for the memory
-//     // we need. It will be less than this since we remove some entries.
-//     int len_est = triplet->nnz + triplet->nrow;
-
-//     cholmod_triplet* new_triplet;
-//     new_triplet = cholmod_allocate_triplet(triplet->nrow, triplet->nrow, len_est,
-//                                            LOWER_TRIANGULAR, CHOLMOD_DOUBLE, state->common);
-
-//     // total self conductance (diagonal entries)
-//     double* g_total = calloc(triplet->nrow, sizeof(double));
-//     double* b_temp = calloc(triplet->nrow, sizeof(double));  // b vector
-//     // By kirchoffs current law, the sum of currents in/out of a group is zero
-//     // assuming no injected current. g_total is initalised to zero also.
-
-//     int t = 0;  // the current index in the new_triplet
-//     for (int i = 0; i < triplet->nnz; i++) {
-//         // get row, col coords and conductance value of current triple
-//         int ri = ((int*)triplet->i)[i];
-//         int ci = ((int*)triplet->j)[i];
-//         double gi = ((double*)triplet->x)[i];
-
-//         // get total conductance into/out-of a group for the diagonals of
-//         // the conductance matrix we are building.
-//         g_total[ri] += gi;
-//         g_total[ci] += gi;
-
-//         // if the row or column belongs to our known input groups then
-//         // adjust b matrix, ie our injected currents, accordingly.
-//         // Remember, the only the lower triangular tripples are given.
-//         if (state->is_input[ri]) {
-//             b_temp[ci] += gi;  // move -gi (upper triangular term) to other side
-//         } else if (state->is_input[ci]) {
-//             b_temp[ri] += gi;  // move -gi (lower triangular term) to other side
-//         } else {
-//             // this isn't a known input row/col
-//             ((int*)new_triplet->i)[t] = ri;
-//             ((int*)new_triplet->j)[t] = ci;
-//             ((double*)new_triplet->x)[t] = -gi;  // -ive off diagonals
-//             t++;  // this will lag behind i
-//         }
-//     }
-
-//     // add diagonal self conductance entries
-//     for (int j = 0; j < new_triplet->nrow; j++) {
-//         if (!state->is_input[j]) {
-//             // ignoring input nodes
-//             ((int*)new_triplet->i)[t] = j;
-//             ((int*)new_triplet->j)[t] = j;
-//             ((double*)new_triplet->x)[t] = g_total[j];
-
-//             // map between matrix coords and actual group indices
-//             state->group_to_mat_map[j] = t;
-//             state->mat_to_group_map[t] = j;
-//             t++;
-//         }
-//     }
-//     cholmod_free_triplet(&triplet, state->common);
-//     free(g_total);
-//     // resize now that we know exactly how big new_triplet is
-//     cholmod_reallocate_triplet(t, new_triplet, state->common);
-
-//     // convert A to sparse
-//     cholmod_sparse *A;
-//     A = cholmod_triplet_to_sparse(new_triplet, new_triplet->nnz, state->common);
-//     cholmod_free_triplet(&new_triplet, state->common);
-//     state->A = A;  // save pointer to state
-
-//     // convert b to sparse
-//     cholmod_triplet *b_triplet;
-//     b_triplet = cholmod_allocate_triplet(new_triplet->nrow, new_triplet->nrow,
-//                                          new_triplet->nrow, 0, CHOLMOD_DOUBLE, state->common);
-
-//     // populate with non-zero b entries
-//     int u = 0;  // b_triplet index
-//     for (int k = 0; k < b_triplet->nrow; k++) {
-//         if (b_temp[k] != 0.0) {
-//             ((int*)b_triplet->i)[u] = k;
-//             ((int*)b_triplet->j)[u] = 1;  // only one column
-//             ((double*)b_triplet->x)[u] = b_temp[k];
-//             u++;
-//         }
-//     }
-//     cholmod_reallocate_triplet(u, b_triplet, state->common);  // shrink to right size
-//     free(b_temp);
-
-//     // convert b to sparse
-//     // we do this not because it saves memory, but because it reduces the
-//     // number of computations required every time we multiply an element of b.
-//     cholmod_sparse *b;
-//     b = cholmod_triplet_to_sparse(b_triplet, u, state->common);
-//     cholmod_free_triplet(&b_triplet, state->common);
-//     state->b = b;  // save to state
-
-//     // TODO: return object containing relevant stuff.
-//     return 0;
-// }
-
-// https://stackoverflow.com/questions/2744181/how-to-call-c-function-from-c
 
 
 #define TRIPLET_DEBUG_LIMIT 10
