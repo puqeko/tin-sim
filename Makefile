@@ -14,5 +14,5 @@ symmetric: make_symmetric.cpp
 	$(CC) -o make_symmetric.o make_symmetric.cpp $(FLAGS)
 
 all: cholesky
-cholesky: cholesky.c
-	$(CCC) -o cholesky.o cholesky.c $(FLAGS)
+cholesky: cholesky.cpp
+	$(CC) -o cholesky.o cholesky.cpp $(FLAGS)

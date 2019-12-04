@@ -7,6 +7,8 @@
  * 
  * Info is printed to stderr.
  * 
+ * Althought cpp is used, the interface is kept to c.
+ * 
  * example use: convert the simple.mtx file to symmetric format
  * ./make_symmetric.o < matrices/simple.mtx > out.mtx
  */
@@ -56,11 +58,10 @@ typedef struct {
  * and allow chomod to initalise itself (clears pointers, stats, default params).
  * Must be called before anything else to obtain our state object.
  * */
-solver_state_t* solver_create_state(void)
+solver_state_t* solver_create_state()
 {
-    solver_state_t* state;
-    state = calloc(1, sizeof(solver_state_t));
-    state->common = calloc(1, sizeof(cholmod_common));
+    solver_state_t* state = new solver_state_t;
+    state->common = new cholmod_common;
 
     // use lower triangular in the default case when storing sparse matrices.
     state->common->prefer_upper = false;
@@ -76,11 +77,11 @@ solver_state_t* solver_create_state(void)
 void solver_destroy_state(solver_state_t* state)
 {
     // deallocate all pointed heap memory
-    if (state->is_input) free(state->is_input);
-    if (state->is_output) free(state->is_output);
+    if (state->is_input) delete state->is_input;
+    if (state->is_output) delete state->is_output;
     if (state->A) cholmod_free_sparse(&state->A, state->common);
     if (state->LD) cholmod_free_factor(&state->LD, state->common);
-    if (state->G) cholmod_free_dense(&state->G, state->common);
+    if (state->G) cholmod_free_sparse(&state->G, state->common);
     if (state->b) cholmod_free_dense(&state->b, state->common);
     if (state->b_set) cholmod_free_sparse(&state->b_set, state->common);
     if (state->x) cholmod_free_dense(&state->x, state->common);
@@ -90,8 +91,8 @@ void solver_destroy_state(solver_state_t* state)
 
     // finish up cholmod and free state
     cholmod_finish(state->common);
-    free(state->common);
-    free(state);
+    delete state->common;
+    delete state;
 }
 
 
@@ -128,8 +129,8 @@ void sort_triplet(cholmod_triplet* triplet)
 {
     // start with the first item 'sorted' then find a place to put the item at
     // position next.
-    for (int next = 1; next < triplet->nnz; next++) {
-        for (int i = next - 1; i >= 0; i--) {
+    for (size_t next = 1; next < triplet->nnz; next++) {
+        for (size_t i = next - 1; i >= 0; i--) {
             if (_triplet_comparitor(triplet, i, i+1) > 0) {
 
                 // swap the ith and (i+1)th items, but we have to do this for
@@ -231,13 +232,13 @@ int solver_initalise_network
 
     // make set of input and output groups for faster O(1) lookup
     if (!state->is_input)
-        state->is_input = calloc(n_groups, sizeof(*state->is_input));
+        state->is_input = new bool[n_groups];
     for (int i = 0; i < n_input_groups; i++) {
         // assume that the group indices are not out of bounds 
         state->is_input[input_groups[i]] = true;
     }
     if (!state->is_output)
-        state->is_output = calloc(n_groups, sizeof(*state->is_output));
+        state->is_output = new bool[n_groups];
     for (int i =0; i < n_output_groups; i++) {
         state->is_output[output_groups[i]] = true;
     }
@@ -252,7 +253,7 @@ int solver_initalise_network
     // state->G = G;
 
     // count the total conductance into each node (the diagonal elements)
-    double *temp_total_g = calloc(n_groups, sizeof(double));
+    double *temp_total_g = new double[n_groups];
 
     // fill in reduce column form
     int it = 0;  // current triplet value index
@@ -357,12 +358,12 @@ void print_triplet(solver_state_t* state, cholmod_triplet* triplet)
 
     // If TRIPLET_DEBUG_LIMIT == -1, print all triplet entries. Otherwise, just
     // print up to TRIPLET_DEBUG_LIMIT number of entries
-    int n_print;
+    size_t n_print;
     if (TRIPLET_DEBUG_LIMIT > 0) n_print = min(triplet->nnz, TRIPLET_DEBUG_LIMIT);
     else n_print = triplet->nnz;
 
     // print each entry
-    for (int i =0; i < n_print; i++) {
+    for (size_t i =0; i < n_print; i++) {
         printf("%d %d %f\n", ((int*)triplet->i)[i], ((int*)triplet->j)[i], ((double*)triplet->x)[i]);
     }
 
