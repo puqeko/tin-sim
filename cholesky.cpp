@@ -24,7 +24,7 @@ typedef struct {
     size_t n_input_groups;
     size_t n_output_groups;
     size_t n_groups;  // use int over size_t for consistancy with cholmod
-    size_t nnz;  // number of non-zero values
+    size_t nnz;  // number of non-zero values in A
 
     // TODO: test if we can use x to store input voltages + solutions togther
     // or is it not safe?
@@ -36,8 +36,8 @@ typedef struct {
 
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
     cholmod_sparse *A;  // the full conductance matrix
-    cholmod_factor *LD;  // the LD decomposition
     cholmod_sparse *G;  // matrix of conductances on the right-hand-side
+    cholmod_factor *LD;  // the LD decomposition
     cholmod_dense *b;  // vector of injected currents b = G v [known voltages]
     cholmod_sparse *b_set;  // pattern of groups which have injected currents
     cholmod_dense *x;  // vector of solved voltages
@@ -45,8 +45,8 @@ typedef struct {
 
     // vectors of length N, if A is NxN, which are allocated for intermediate
     // steps in the solve process and reused by the cholmod api
-    cholmod_dense *y_handle;
-    cholmod_dense *e_handle;
+    cholmod_dense *y;
+    cholmod_dense *e;
 } solver_state_t;
 
 // a vector or vectors each containing pairs (the row index and conductance)
@@ -88,8 +88,8 @@ void solver_destroy_state(solver_state_t* state)
     if (state->b_set) cholmod_free_sparse(&state->b_set, state->common);
     if (state->x) cholmod_free_dense(&state->x, state->common);
     if (state->x_set) cholmod_free_sparse(&state->x_set, state->common);
-    if (state->y_handle) cholmod_free_dense(&state->y_handle, state->common);
-    if (state->e_handle) cholmod_free_dense(&state->e_handle, state->common);
+    if (state->y) cholmod_free_dense(&state->y, state->common);
+    if (state->e) cholmod_free_dense(&state->e, state->common);
 
     // finish up cholmod and free state
     cholmod_finish(state->common);
@@ -462,6 +462,17 @@ int solver_initalise_network
     ((int*)A->p)[i] = nz;  // for A matrix
     ((int*)G->p)[j] = jx;  // for G matrix
 
+    state->b = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+    state->b_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
+                                           CHOLMOD_PATTERN, state->common);
+    state->x = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+    state->x_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
+                                           CHOLMOD_PATTERN, state->common);
+
+    // vectors allocated for intermediate steps and used by cholmod solve2
+    state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+    state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+
     return 0;
 }
 
@@ -524,8 +535,8 @@ void testcase_0()
     int input_groups[] = {1, 2}; int n_inputs = 2;  // set v_1 and v_2 as known
     int output_groups[] = {0, 1, 2, 3}; int n_ouputs = 4;  // get all voltages
 
-    // // Initalise the solver. This will construct the A matrix and b vector used
-    // // to represent the system.
+    // Initalise the solver. This will construct the A matrix and b vector used
+    // to represent the system.
     solver_initalise_network(state, triplet,
                              &input_groups[0], n_inputs,
                              &output_groups[0], n_ouputs);
