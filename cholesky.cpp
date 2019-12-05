@@ -26,12 +26,9 @@ typedef struct {
     size_t n_groups;  // use int over size_t for consistancy with cholmod
     size_t nnz;  // number of non-zero values in A
 
-    // TODO: test if we can use x to store input voltages + solutions togther
-    // or is it not safe?
-    // double *voltages;
-
-    size_t *group_to_mat_map;
-    size_t *mat_to_group_map;
+    // since the matrix doesn't contain input groups (knowns), we need mappings
+    size_t *group_to_mat_map;  // mapping from group index to matrix index
+    size_t *mat_to_group_map;  // mapping from matrix index to group index
     size_t n_mat;  // matrix size (should be n_groups - n_input_groups) size(A)
 
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
@@ -217,8 +214,8 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
 /**
  * Compute the A matrix and b vector from a triplet and input vector.
  * 
- * This is prep for solving Ax = b, where x is a vector of group voltages and b
- * is a vector of injected currents.
+ * This is prep for solving Ax = Gv = b, where x is a vector of group voltages
+ * and b is a vector of injected currents obtained from the known voltages.
  * 
  * The input triplet is a list where each entry is a coordinate between two
  * groups and the conductance of that connection. The input triplet is expected
@@ -238,8 +235,6 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
  * specified, then the system has the solution x = a, where a is some voltage.
  * Hence, the number of input groups should be at-least 2.
  * 
- * About 2*nnz + 3*nrows memory is needed, where nnz is the number of non-zero
- * entries (excluding globals).
  * Other memory will be allocated into state if needed.
  * 
  * @param state: where all our data/results are kept
@@ -462,6 +457,27 @@ int solver_initalise_network
     ((int*)A->p)[i] = nz;  // for A matrix
     ((int*)G->p)[j] = jx;  // for G matrix
 
+    return 0;
+}
+
+/**
+ * Create the inital decomposition and configure cholmod ready for some
+ * speedy calculations. Must call solver_initalise_network on a state first.
+ * 
+ * @param state: the state object of the system we are solving
+ * */
+int solver_begin(solver_state_t *state)
+{
+    if (!state->is_input || !state->is_output || !state->group_to_mat_map ||
+        !state->mat_to_group_map || !state->A || !state->G) {
+        std::cout << "Must call solver_initalise_network() before starting.\n";
+        return -1;
+    }
+
+    // vectors allocated for the injected current vector b and solution vector x
+    // each vector is stored in dense form with a sparse pattern which tells
+    // cholmod which rows to compute (hense reducing the number of computations)
+    const size_t &n_mat = state->n_mat;
     state->b = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
     state->b_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
                                            CHOLMOD_PATTERN, state->common);
@@ -470,10 +486,11 @@ int solver_initalise_network
                                            CHOLMOD_PATTERN, state->common);
 
     // vectors allocated for intermediate steps and used by cholmod solve2
+    // eg the y = L\b step etc
     state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
     state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
 
-    return 0;
+    // TODO: populate x_set from output map
 }
 
 /**
