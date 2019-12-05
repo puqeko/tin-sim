@@ -62,8 +62,6 @@ solver_state_t* solver_create_state()
 
     // use lower triangular in the default case when storing sparse matrices.
     state->common->prefer_upper = false;
-
-    cholmod_start(state->common);
     return state;
 }
 
@@ -89,7 +87,6 @@ void solver_destroy_state(solver_state_t* state)
     if (state->e) cholmod_free_dense(&state->e, state->common);
 
     // finish up cholmod and free state
-    cholmod_finish(state->common);
     delete state->common;
     delete state;
 }
@@ -235,7 +232,25 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
  * specified, then the system has the solution x = a, where a is some voltage.
  * Hence, the number of input groups should be at-least 2.
  * 
- * Other memory will be allocated into state if needed.
+ * Memory requirements:
+ * 3*nnz for triplet
+ * 2*(nnz + n_groups) for adj_c
+ * 2*nnz for adj_r
+ * triplet dealloced => -3*nnz
+ * 2*nnz + n_mat for A
+ * < n_input_groups*n_mat for G
+ * 
+ * Assuming nnz >> n_groups, n_mat, n_input_groups and the number of inputs is
+ * small then the most memory needed at any one time is between 7*nnz - 9*nnz,
+ * but we probably don't need matrices big enough to care about this. Other
+ * memory will be allocated into state for input/output lookup tables and
+ * group-to-matrix index mappings (size proportonal to n_groups).
+ * 
+ * Time complexity:
+ * O(nnz)
+ * 
+ * nnz: the number of non-zero elements.
+ * 
  * 
  * @param state: where all our data/results are kept
  * @param triplet: a cholmod_triplet describing the network (this will get freed!)
@@ -244,7 +259,7 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
  * @param output_groups: a vector of groups we want to know the voltage of
  * @param n_output_groups: number of output groups
  * 
- * @returns: 0 on success, error otherwise
+ * @returns: 0 on completion, error otherwise
  * */
 int solver_initalise_network
 (
@@ -287,6 +302,8 @@ int solver_initalise_network
                 triplet->ncol, triplet->nrow, triplet->stype, triplet->xtype);
         return -1;
     }
+
+    cholmod_start(state->common);
 
     // remember these
     state->n_groups = n_groups;
@@ -457,22 +474,9 @@ int solver_initalise_network
     ((int*)A->p)[i] = nz;  // for A matrix
     ((int*)G->p)[j] = jx;  // for G matrix
 
-    return 0;
-}
-
-/**
- * Create the inital decomposition and configure cholmod ready for some
- * speedy calculations. Must call solver_initalise_network on a state first.
- * 
- * @param state: the state object of the system we are solving
- * */
-int solver_begin(solver_state_t *state)
-{
-    if (!state->is_input || !state->is_output || !state->group_to_mat_map ||
-        !state->mat_to_group_map || !state->A || !state->G) {
-        std::cout << "Must call solver_initalise_network() before starting.\n";
-        return -1;
-    }
+    // now we know the actual nnz, so shead unused memory
+    cholmod_reallocate_sparse(ix, A, state->common);
+    cholmod_reallocate_sparse(jx, G, state->common);
 
     // vectors allocated for the injected current vector b and solution vector x
     // each vector is stored in dense form with a sparse pattern which tells
@@ -489,6 +493,24 @@ int solver_begin(solver_state_t *state)
     // eg the y = L\b step etc
     state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
     state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+
+    cholmod_finish(state->common);
+
+    return 0;
+}
+
+/**
+ * Create the inital decomposition and configure cholmod ready for some
+ * speedy calculations. Must call solver_initalise_network on a state first.
+ * 
+ * @param state: the state object of the system we are solving
+ * */
+int solver_begin(solver_state_t *state)
+{
+    if (!state->A || !state->G) {
+        std::cout << "Must call solver_initalise_network() before starting.\n";
+        return -1;
+    }
 
     // TODO: populate x_set from output map
 }
