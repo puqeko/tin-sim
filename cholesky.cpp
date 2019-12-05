@@ -34,12 +34,18 @@ typedef struct {
     // lookup table: is_input[i] is true if group i is an input else it is false
     bool *is_input;
     bool *is_output;  // same as for input, but these are the output nodes
+    size_t n_input_groups;
+    size_t n_output_groups;
     size_t n_groups;  // use int over size_t for consistancy with cholmod
     size_t nnz;  // number of non-zero values
 
     // TODO: test if we can use x to store input voltages + solutions togther
     // or is it not safe?
     // double *voltages;
+
+    size_t *group_to_mat_map;
+    size_t *mat_to_group_map;
+    size_t n_mat;  // matrix size (should be n_groups - n_input_groups) size(A)
 
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
     cholmod_sparse *A;  // the full conductance matrix
@@ -86,6 +92,8 @@ void solver_destroy_state(solver_state_t* state)
     // deallocate all pointed heap memory
     if (state->is_input) delete state->is_input;
     if (state->is_output) delete state->is_output;
+    if (state->group_to_mat_map) delete state->group_to_mat_map;
+    if (state->mat_to_group_map) delete state->mat_to_group_map;
     if (state->A) cholmod_free_sparse(&state->A, state->common);
     if (state->LD) cholmod_free_factor(&state->LD, state->common);
     if (state->G) cholmod_free_sparse(&state->G, state->common);
@@ -179,7 +187,7 @@ void print_adj(adj_list_t &adj_c)
 void print_sparse(solver_state_t *state, cholmod_sparse *A)
 {
     printf("Sparse:\n");
-    for (size_t i = 0; i < state->n_groups; i++) {
+    for (size_t i = 0; i < state->n_mat+1; i++) {
         printf("%d ", ((int*)A->p)[i]);
     }
     printf("\n");
@@ -271,6 +279,8 @@ int solver_initalise_network
 
     size_t n_groups = triplet->nrow;  // ie, the total number of groups
     state->n_groups = n_groups;
+    state->n_input_groups = n_input_groups;
+    state->n_output_groups = n_output_groups;
 
     // make set of input and output groups for faster O(1) lookup
     if (!state->is_input)
@@ -330,41 +340,71 @@ int solver_initalise_network
         }
     }
 
+    print_adj(adj_c);
+    print_adj(adj_r);
+
+    // A matrix size
+    size_t n_mat = n_groups - n_input_groups;
+    state->n_mat = n_mat;
+
+    // map from group index to matrix index
+    state->group_to_mat_map = new size_t[n_groups];
+    state->mat_to_group_map = new size_t[n_mat];
+
+    size_t ig = 0;  // current group index
+    size_t i = 0;  // current matrix index
+    for (; ig < n_groups; ig++) {
+        if (state->is_input[ig]) {
+            // mark as input group
+            state->group_to_mat_map[ig] = -1;
+        } else {
+            // create group mapping from group index to matrix index and visa versa
+            state->group_to_mat_map[ig] = i;
+            state->mat_to_group_map[i] = ig;
+            i++;  // next matrix index
+        }
+    }
+
     // the empty matrix we are going to fill
     cholmod_sparse* A = cholmod_allocate_sparse(
-        n_groups, n_groups, nnz + n_groups, true, true,
+        n_mat, n_mat, nnz + n_groups, true, true,
         LOWER_TRIANGULAR, CHOLMOD_REAL, state->common);
 
     state->A = A;  // save a reference in state
 
-    print_adj(adj_c);
-    print_adj(adj_r);
-
     // fill in A matrix as reduced symmetric column form
     size_t ix = 0;  // current A matrix value index
-    size_t ig = 0;  // current group
-    size_t i = 0; // current matrix index
+    ig = 0;  // current group
+    i = 0; // current matrix index
 
     for (ig = 0; ig < n_groups; ig++) {
-        // use inputs for sum but don't add to sparse matrix A
-        // otherwise, this group is an unknown and should be added to A
-        ((int*)A->p)[ig] = ix;  // pointer to column start
+        if (state->is_input[ig]) {
+            
+        } else {
+            ((int*)A->p)[i] = ix;  // pointer to column start
 
-        for (auto &pair : adj_c[ig]) {
-            size_t &ir = pair.first;  // get the row index
-            double &g = pair.second;  // conductance
+            for (auto &pair : adj_c[ig]) {
+                size_t &ir = pair.first;  // get the row index
+                double &g = pair.second;  // conductance
 
-            // save matrix value for half of the matrix
-            ((double*)A->x)[ix] = g;
-            ((int*)A->i)[ix] = ir;  // row index in column
-            ix++;
+                if (!state->is_input[ir]) {
+                    // save matrix value for half of the matrix
+                    ((double*)A->x)[ix] = g;
+                    ((int*)A->i)[ix] = state->group_to_mat_map[ir];  // row index in column
+                    ix++;
+                }
+            }
+
+            // move to next matrix index
+            i++;
         }
     }
     // the number of nonzeros
     // the array A->p is of length [n columns] + 1 where the last is nnz
     size_t nz = ix;
     state->nnz = nz;
-    ((int*)A->p)[ig] = nz;
+    ((int*)A->p)[i] = nz;
+    std::cout << nz << '\n';
 
     cholmod_print_sparse(A, NULL, state->common);
     print_sparse(state, A);
