@@ -54,6 +54,8 @@ typedef std::vector<std::vector<link_t> > adj_list_t;
  * Allocate memory for a state object needed for cholmod operations, configure,
  * and allow chomod to initalise itself (clears pointers, stats, default params).
  * Must be called before anything else to obtain our state object.
+ * 
+ * Must only every be one state, because of cholmod_start/finish.
  * */
 solver_state_t* solver_create_state()
 {
@@ -62,6 +64,8 @@ solver_state_t* solver_create_state()
 
     // use lower triangular in the default case when storing sparse matrices.
     state->common->prefer_upper = false;
+
+    cholmod_start(state->common);
     return state;
 }
 
@@ -85,6 +89,8 @@ void solver_destroy_state(solver_state_t* state)
     if (state->x_set) cholmod_free_sparse(&state->x_set, state->common);
     if (state->y) cholmod_free_dense(&state->y, state->common);
     if (state->e) cholmod_free_dense(&state->e, state->common);
+
+    cholmod_finish(state->common);
 
     // finish up cholmod and free state
     delete state->common;
@@ -233,15 +239,18 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
  * Hence, the number of input groups should be at-least 2.
  * 
  * Memory requirements:
- * 3*nnz for triplet
- * 2*(nnz + n_groups) for adj_c
- * 2*nnz for adj_r
- * triplet dealloced => -3*nnz
- * 2*nnz + n_mat for A
- * < n_input_groups*n_mat for G
+ * 2*nnz for triplet
+ * 1.5*(nnz + n_groups) for adj_c
+ * 1.5*nnz for adj_r
+ * triplet dealloced => -2*nnz
+ * 1.5*nnz + n_mat for A
+ * < 1.5*n_input_groups*n_mat + n_input_groups for G
+ * 
+ * 0.5 for int type (assuming 4 bytes) and 1 for double type (8 bytes)
  * 
  * Assuming nnz >> n_groups, n_mat, n_input_groups and the number of inputs is
- * small then the most memory needed at any one time is between 7*nnz - 9*nnz,
+ * small then the most memory needed at any one time is roughly:
+ * => 8 * 5 * nnz (bytes)
  * but we probably don't need matrices big enough to care about this. Other
  * memory will be allocated into state for input/output lookup tables and
  * group-to-matrix index mappings (size proportonal to n_groups).
@@ -250,7 +259,6 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
  * O(nnz)
  * 
  * nnz: the number of non-zero elements.
- * 
  * 
  * @param state: where all our data/results are kept
  * @param triplet: a cholmod_triplet describing the network (this will get freed!)
@@ -302,8 +310,6 @@ int solver_initalise_network
                 triplet->ncol, triplet->nrow, triplet->stype, triplet->xtype);
         return -1;
     }
-
-    cholmod_start(state->common);
 
     // remember these
     state->n_groups = n_groups;
@@ -481,7 +487,6 @@ int solver_initalise_network
     // vectors allocated for the injected current vector b and solution vector x
     // each vector is stored in dense form with a sparse pattern which tells
     // cholmod which rows to compute (hense reducing the number of computations)
-    const size_t &n_mat = state->n_mat;
     state->b = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
     state->b_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
                                            CHOLMOD_PATTERN, state->common);
@@ -493,8 +498,6 @@ int solver_initalise_network
     // eg the y = L\b step etc
     state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
     state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
-
-    cholmod_finish(state->common);
 
     return 0;
 }
