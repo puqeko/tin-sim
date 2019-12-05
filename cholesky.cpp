@@ -1,17 +1,4 @@
-/* make_symmetric.cpp
- * 
- * Checks to see if a matrix, given in .mtx format to stdin, is stored as a
- * symmetric matrix in lower triangular form. If it is not, check if we can
- * safely convert to lower triangular symmetric form, do the conversion, then
- * save out to stdout.
- * 
- * Info is printed to stderr.
- * 
- * Althought cpp is used, the interface is kept to c.
- * 
- * example use: convert the simple.mtx file to symmetric format
- * ./make_symmetric.o < matrices/simple.mtx > out.mtx
- */
+/* cholesky.cpp */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -167,10 +154,10 @@ void sort_triplet(cholmod_triplet* triplet)
     }
 }
 
-// print an adjacancy list
-void print_adj(adj_list_t &adj_c)
+// warning: don't print large matrices
+void print_adj(const adj_list_t &adj_c, const char *name)
 {
-    std::cout << "Adjacancy list:\n";
+    std::cout << name << std::endl;
     int i = 0;
     for (auto a : adj_c) {
          std::cout << i++ << ": ";
@@ -184,9 +171,35 @@ void print_adj(adj_list_t &adj_c)
      std::cout << "\n";
 }
 
-void print_sparse(solver_state_t *state, cholmod_sparse *A)
+#define TRIPLET_DEBUG_LIMIT 10
+void print_triplet(solver_state_t* state, cholmod_triplet* triplet, const char* name)
 {
-    printf("Sparse:\n");
+    printf("%s:\n", name);
+    cholmod_print_triplet(triplet, NULL, state->common);
+
+    // If TRIPLET_DEBUG_LIMIT == -1, print all triplet entries. Otherwise, just
+    // print up to TRIPLET_DEBUG_LIMIT number of entries
+    size_t n_print;
+    if (TRIPLET_DEBUG_LIMIT > 0) n_print = min(triplet->nnz, TRIPLET_DEBUG_LIMIT);
+    else n_print = triplet->nnz;
+
+    // print each entry
+    for (size_t i =0; i < n_print; i++) {
+        printf("%d %d %f\n", ((int*)triplet->i)[i], ((int*)triplet->j)[i], ((double*)triplet->x)[i]);
+    }
+
+    // Show ... if we skipped some entires
+    if (n_print < triplet->nnz) printf("...\n\n");
+    else printf("\n");
+}
+
+// warning: don't print large matrices
+void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
+{
+    printf("%s:\n", name);
+    // print info about matrix
+    cholmod_print_sparse(A, NULL, state->common);
+    // print values
     for (size_t i = 0; i < state->n_mat+1; i++) {
         printf("%d ", ((int*)A->p)[i]);
     }
@@ -198,7 +211,7 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A)
     for (size_t i = 0; i < state->nnz; i++) {
         printf("%f ", ((double*)A->x)[i]);
     }
-    printf("\n");
+    printf("\n\n");
 }
 
 /**
@@ -256,6 +269,13 @@ int solver_initalise_network
         return -1;
     }
 
+    size_t n_groups = triplet->nrow;  // ie, the total number of groups
+
+    if (n_input_groups == n_groups) {
+        fprintf(stderr, "Nothing to do. All the voltages are known.\n");
+        return -1;
+    }
+
     // see main comment above
     if (n_input_groups < 2) {
         fprintf(stderr, "Warning: You probably intended to specify more than one "
@@ -273,14 +293,14 @@ int solver_initalise_network
         return -1;
     }
 
-    // make sure triplet is sorted by column then row in increasing order
-    // the adjacancy list will also be sorted then
-    sort_triplet(triplet);
-
-    size_t n_groups = triplet->nrow;  // ie, the total number of groups
+    // remember these
     state->n_groups = n_groups;
     state->n_input_groups = n_input_groups;
     state->n_output_groups = n_output_groups;
+
+    // make sure triplet is sorted by column then row in increasing order
+    // the adjacancy list will also be sorted then
+    sort_triplet(triplet);
 
     // make set of input and output groups for faster O(1) lookup
     if (!state->is_input)
@@ -340,8 +360,8 @@ int solver_initalise_network
         }
     }
 
-    print_adj(adj_c);
-    print_adj(adj_r);
+    // print_adj(adj_c, "Column wise adjacancy:");
+    // print_adj(adj_r, "Row wise adjacancy:");
 
     // A matrix size
     size_t n_mat = n_groups - n_input_groups;
@@ -372,14 +392,51 @@ int solver_initalise_network
 
     state->A = A;  // save a reference in state
 
+    // the empty matrix we are going to fill
+    cholmod_sparse* G = cholmod_allocate_sparse(
+        n_mat, n_input_groups, n_input_groups * n_mat, true, true,
+        LOWER_TRIANGULAR, CHOLMOD_REAL, state->common);
+
+    state->G = G;  // save a reference in state
+
     // fill in A matrix as reduced symmetric column form
     size_t ix = 0;  // current A matrix value index
+    size_t jx = 0;  // current G matrix value index 
     ig = 0;  // current group
-    i = 0; // current matrix index
+    i = 0;  // current matrix index A (unknown)
+    size_t j = 0;  // current matrix index G (input)
 
     for (ig = 0; ig < n_groups; ig++) {
         if (state->is_input[ig]) {
-            
+            ((int*)G->p)[j] = jx;
+
+            // Add all non-input column entries above the diagonal.
+            // Since the matrix is symmetric, this is the same as
+            // adding all row entries to the left, which we known.
+            for (auto &pair : adj_r[ig]) {
+                size_t &jr = pair.first;  // get the row index
+                double &g = pair.second;  // conductance
+
+                if (!state->is_input[jr]) {
+                    // save matrix value for half of the matrix
+                    ((double*)G->x)[jx] = -g;  // -ve since on rhs
+                    ((int*)G->i)[jx] = state->group_to_mat_map[jr];  // row index in column
+                    jx++;
+                }
+            }
+            // add all non-input col entries below (and including) the diagonal
+            for (auto &pair : adj_c[ig]) {
+                size_t &jr = pair.first;  // get the row index
+                double &g = pair.second;  // conductance
+
+                if (!state->is_input[jr]) {
+                    // save matrix value for half of the matrix
+                    ((double*)G->x)[jx] = -g;  // -ve since on rhs
+                    ((int*)G->i)[jx] = state->group_to_mat_map[jr];  // row index in column
+                    jx++;
+                }
+            }
+            j++;
         } else {
             ((int*)A->p)[i] = ix;  // pointer to column start
 
@@ -394,7 +451,6 @@ int solver_initalise_network
                     ix++;
                 }
             }
-
             // move to next matrix index
             i++;
         }
@@ -403,11 +459,8 @@ int solver_initalise_network
     // the array A->p is of length [n columns] + 1 where the last is nnz
     size_t nz = ix;
     state->nnz = nz;
-    ((int*)A->p)[i] = nz;
-    std::cout << nz << '\n';
-
-    cholmod_print_sparse(A, NULL, state->common);
-    print_sparse(state, A);
+    ((int*)A->p)[i] = nz;  // for A matrix
+    ((int*)G->p)[j] = jx;  // for G matrix
 
     return 0;
 }
@@ -430,28 +483,6 @@ cholmod_triplet* triplet_from_file
     // TODO: check if real && coords && lower triangular
 
     return conductance_coords;
-}
-
-
-#define TRIPLET_DEBUG_LIMIT 10
-void print_triplet(solver_state_t* state, cholmod_triplet* triplet)
-{
-    cholmod_print_triplet(triplet, NULL, state->common);
-
-    // If TRIPLET_DEBUG_LIMIT == -1, print all triplet entries. Otherwise, just
-    // print up to TRIPLET_DEBUG_LIMIT number of entries
-    size_t n_print;
-    if (TRIPLET_DEBUG_LIMIT > 0) n_print = min(triplet->nnz, TRIPLET_DEBUG_LIMIT);
-    else n_print = triplet->nnz;
-
-    // print each entry
-    for (size_t i =0; i < n_print; i++) {
-        printf("%d %d %f\n", ((int*)triplet->i)[i], ((int*)triplet->j)[i], ((double*)triplet->x)[i]);
-    }
-
-    // Show ... if we skipped some entires
-    if (n_print < triplet->nnz) printf("...\n\n");
-    else printf("\n");
 }
 
 
@@ -485,7 +516,7 @@ void testcase_0()
     // Notice that only the entries with to > from are specified, since the
     // matrix is symmetric (connections go both ways).
     cholmod_triplet *triplet = triplet_from_file(state, "matrices/testcase_0.mtx");
-    print_triplet(state, triplet);
+    print_triplet(state, triplet, "Input");
 
     // Set which indices we want to be inputs and outputs. This allows us to
     // deterwmine which voltages are known and unknown and which solutions we
@@ -498,6 +529,9 @@ void testcase_0()
     solver_initalise_network(state, triplet,
                              &input_groups[0], n_inputs,
                              &output_groups[0], n_ouputs);
+
+    print_sparse(state, state->A, "A");
+    print_sparse(state, state->G, "G");
 
     solver_destroy_state(state);
     // state can no longer be used
