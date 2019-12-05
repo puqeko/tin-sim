@@ -4,8 +4,8 @@ default: all
 include $(SSPATH)/SuiteSparse_config/SuiteSparse_config.mk
 
 # compiler commands (change this for your compiler)
-CC = g++-9 -std=c++17 -Wall
-CCC = gcc-9 -std=c11 -Wall
+CC = g++-9 -std=c++17 -Wall -O2
+CCC = gcc-9 -std=c11 -Wall -O2
 
 # compiler flags
 FLAGS = -I$(SSPATH)/include -L$(SSPATH)/lib -lumfpack -lamd -lcholmod -lsuitesparseconfig -lm
