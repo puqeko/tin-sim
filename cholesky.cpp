@@ -199,19 +199,23 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
     printf("%s:\n", name);
     // print info about matrix
     cholmod_print_sparse(A, NULL, state->common);
+    size_t nnz = cholmod_nnz(A, state->common);
     // print values
-    for (size_t i = 0; i < state->n_mat+1; i++) {
+    for (size_t i = 0; i < A->ncol+1; i++) {
         printf("%d ", ((int*)A->p)[i]);
     }
     printf("\n");
-    for (size_t i = 0; i < state->nnz; i++) {
+    for (size_t i = 0; i < nnz; i++) {
         printf("%d ", ((int*)A->i)[i]);
     }
     printf("\n");
-    for (size_t i = 0; i < state->nnz; i++) {
-        printf("%f ", ((double*)A->x)[i]);
+    if (A->xtype == CHOLMOD_REAL) {
+        for (size_t i = 0; i < nnz; i++) {
+            printf("%f ", ((double*)A->x)[i]);
+        }
+        printf("\n");
     }
-    printf("\n\n");
+    printf("\n");
 }
 
 /**
@@ -484,20 +488,29 @@ int solver_initalise_network
     cholmod_reallocate_sparse(ix, A, state->common);
     cholmod_reallocate_sparse(jx, G, state->common);
 
-    // vectors allocated for the injected current vector b and solution vector x
-    // each vector is stored in dense form with a sparse pattern which tells
-    // cholmod which rows to compute (hense reducing the number of computations)
-    state->b = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
-    state->b_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
-                                           CHOLMOD_PATTERN, state->common);
-    state->x = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
-    state->x_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
-                                           CHOLMOD_PATTERN, state->common);
+    // create b_set pattern
+    // This is the pattern of output voltages we care about, which means we can
+    // reduce the number of multiplications
+    cholmod_sparse *b_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
+                                                    CHOLMOD_PATTERN, state->common);
 
-    // vectors allocated for intermediate steps and used by cholmod solve2
-    // eg the y = L\b step etc
-    state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
-    state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+    state->b_set = b_set;
+    int *b_set_p = (int*)(b_set->p);
+    int *b_set_i = (int*)(b_set->i);
+
+    // std::sort(output_groups, output_groups + n_output_groups);
+    b_set_p[0] = 0;  // point to first column
+    ig = 0;
+    i = 0;
+    for(; ig < n_output_groups; ig++) {
+        if (!state->is_input[output_groups[ig]]) {
+            b_set_i[i] = state->group_to_mat_map[output_groups[ig]];
+            i++;
+        }
+    }
+    b_set_p[1] = i;  // nnz
+
+    print_sparse(state, state->b_set, "b_set");
 
     return 0;
 }
@@ -515,7 +528,27 @@ int solver_begin(solver_state_t *state)
         return -1;
     }
 
-    // TODO: populate x_set from output map
+    // get symbolic factor and compute permutation
+    state->LD = cholmod_analyze(state->A, state->common);
+    // get actual factorisation for LDLT
+    cholmod_factorize(state->A, state->LD, state->common);
+
+    // vectors allocated for the injected current vector b and solution vector x
+    // each vector is stored in dense form with a sparse pattern which tells
+    // cholmod which rows to compute (hense reducing the number of computations)
+    const size_t &n_mat = state->n_mat;
+    state->x = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+    state->x_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
+                                           CHOLMOD_PATTERN, state->common);
+
+    state->b = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+
+    // vectors allocated for intermediate steps and used by cholmod solve2
+    // eg the y = L\b step etc
+    state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+    state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+
+    return 0;
 }
 
 /**
@@ -590,8 +623,64 @@ void testcase_0()
     // state can no longer be used
 }
 
+void testcase_1(size_t iter)
+{
+    // initalise module
+    solver_state_t* state = solver_create_state();
+
+    cholmod_triplet *triplet = triplet_from_file(state, "matrices/testcase_0.mtx");
+    print_triplet(state, triplet, "Input");
+
+    // Set which indices we want to be inputs and outputs. This allows us to
+    // deterwmine which voltages are known and unknown and which solutions we
+    // care about
+    int input_groups[] = {1, 2}; int n_inputs = 2;  // set v_1 and v_2 as known
+    int output_groups[] = {0, 1, 2, 3}; int n_ouputs = 4;  // get all voltages
+
+    // Initalise the solver. This will construct the A matrix and b vector used
+    // to represent the system.
+    solver_initalise_network(state, triplet,
+                             &input_groups[0], n_inputs,
+                             &output_groups[0], n_ouputs);
+
+    print_sparse(state, state->A, "A");
+    print_sparse(state, state->G, "G");
+
+    solver_begin(state);
+
+    double known_voltages[] = {1, 0};
+    cholmod_dense *v = cholmod_zeros(2, 1, CHOLMOD_REAL, state->common);
+    double *vx = (double*)(v->x);
+    for (size_t i = 0; i < 2; i++) vx[i] = known_voltages[i];
+
+    for (size_t i = 0; i < iter; i++) {
+        // compute b matrix
+        // b = alpha*(A*x) + beta*b
+        double alpha[] = {1, 1};
+        double beta[] = {0, 0};
+        cholmod_sdmult(state->G, false, alpha, beta, v, state->b, state->common);
+        cholmod_print_dense(state->b, NULL, state->common);
+        double *bx = (double*)(state->b->x);
+        for (size_t j = 0; j < state->n_mat; j++) {
+            std::cout << bx[j] << ' ';
+        }
+        std::cout << std::endl;
+
+        cholmod_solve2(CHOLMOD_A, state->LD, state->b, state->b_set, &state->x,
+                       &state->x_set, &state->y, &state->e, state->common);
+        
+        cholmod_print_dense(state->x, NULL, state->common);
+        double *xx = (double*)(state->x->x);
+        for (size_t j = 0; j < state->n_mat; j++) {
+            std::cout << xx[j] << ' ';
+        } 
+        std::cout << std::endl;
+    }
+
+    solver_destroy_state(state);
+}
 
 int main ()
 {
-    testcase_0();
+    testcase_1(1);
 }
