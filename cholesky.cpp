@@ -102,17 +102,20 @@ void solver_destroy_state(solver_state_t* state)
 // Returns -1 if left < right, 1 if left > right, else 0
 int _triplet_comparitor(cholmod_triplet *triplet, const int &l, const int &r)
 {
+    // get pointers to triplet storage elements
+    int* ti = (int*)triplet->i;  // row index
+    int* tj = (int*)triplet->j;  // col index
+
     // sort out the types of our inputs
     // the reason this code looks like cancer is because we must cast all the
     // void pointers to types so that c knows how to deal with them
     // this happens for triplet properties and for this function's arguments
-
-    if (((int*)triplet->j)[l] < ((int*)triplet->j)[r]) return -1;
-    else if (((int*)triplet->j)[l] > ((int*)triplet->j)[r]) return 1;
+    if (tj[l] < tj[r]) return -1;
+    else if (tj[l] > tj[r]) return 1;
     else {
         // the column number is the same, so compare row
-        if (((int*)triplet->i)[l] < ((int*)triplet->i)[r]) return -1;
-        else if (((int*)triplet->i)[l] > ((int*)triplet->i)[r]) return 1;
+        if (ti[l] < ti[r]) return -1;
+        else if (ti[l] > ti[r]) return 1;
     }
     return 0;  // default
 }
@@ -129,6 +132,11 @@ int _triplet_comparitor(cholmod_triplet *triplet, const int &l, const int &r)
  * */
 void sort_triplet(cholmod_triplet* triplet)
 {
+    // get pointers to triplet storage elements
+    int* ti = (int*)triplet->i;  // row index
+    int* tj = (int*)triplet->j;  // col index
+    double* tx = (double*)triplet->x;  // value
+
     // start with the first item 'sorted' then find a place to put the item at
     // position next.
     for (size_t next = 1; next < triplet->nnz; next++) {
@@ -137,17 +145,17 @@ void sort_triplet(cholmod_triplet* triplet)
 
                 // swap the ith and (i+1)th items, but we have to do this for
                 // all three lists (the row/col index and conductance value)
-                int tempi = ((int*)triplet->i)[i];
-                int tempj = ((int*)triplet->j)[i];
-                double tempx = ((double*)triplet->x)[i];
+                int tempi = ti[i];
+                int tempj = tj[i];
+                double tempx = tx[i];
 
-                ((int*)triplet->i)[i] = ((int*)triplet->i)[i+1];
-                ((int*)triplet->j)[i] = ((int*)triplet->j)[i+1];
-                ((double*)triplet->x)[i] = ((double*)triplet->x)[i+1];
+                ti[i] = ti[i+1];
+                tj[i] = tj[i+1];
+                tx[i] = tx[i+1];
 
-                ((int*)triplet->i)[i+1] = tempi;
-                ((int*)triplet->j)[i+1] = tempj;
-                ((double*)triplet->x)[i+1] = tempx;
+                ti[i+1] = tempi;
+                tj[i+1] = tempj;
+                tx[i+1] = tempx;
             }
             else break;  // otherwise, these are sorted so move to next one
         }
@@ -428,9 +436,19 @@ int solver_initalise_network
     i = 0;  // current matrix index A (unknown)
     size_t j = 0;  // current matrix index G (input)
 
+    // get pointers to sparse storage elements of A and G for compressed col form
+    int* Gp = (int*)(G->p);
+    int* Gi = (int*)(G->i);
+    double* Gx = (double*)(G->x);
+
+    int* Ap = (int*)(A->p);
+    int* Ai = (int*)(A->i);
+    double* Ax = (double*)(A->x);
+
+    // now let's actually construct the A and G matrices
     for (ig = 0; ig < n_groups; ig++) {
         if (state->is_input[ig]) {
-            ((int*)G->p)[j] = jx;
+            Gp[j] = jx;
 
             // Add all non-input column entries above the diagonal.
             // Since the matrix is symmetric, this is the same as
@@ -441,8 +459,8 @@ int solver_initalise_network
 
                 if (!state->is_input[jr]) {
                     // save matrix value for half of the matrix
-                    ((double*)G->x)[jx] = -g;  // -ve since on rhs
-                    ((int*)G->i)[jx] = state->group_to_mat_map[jr];  // row index in column
+                    Gx[jx] = -g;  // -ve since on rhs
+                    Gi[jx] = state->group_to_mat_map[jr];  // row index in column
                     jx++;
                 }
             }
@@ -453,14 +471,14 @@ int solver_initalise_network
 
                 if (!state->is_input[jr]) {
                     // save matrix value for half of the matrix
-                    ((double*)G->x)[jx] = -g;  // -ve since on rhs
-                    ((int*)G->i)[jx] = state->group_to_mat_map[jr];  // row index in column
+                    Gx[jx] = -g;  // -ve since on rhs
+                    Gi[jx] = state->group_to_mat_map[jr];  // row index in column
                     jx++;
                 }
             }
             j++;
         } else {
-            ((int*)A->p)[i] = ix;  // pointer to column start
+            Ap[i] = ix;  // pointer to column start
 
             for (auto &pair : adj_c[ig]) {
                 size_t &ir = pair.first;  // get the row index
@@ -468,8 +486,8 @@ int solver_initalise_network
 
                 if (!state->is_input[ir]) {
                     // save matrix value for half of the matrix
-                    ((double*)A->x)[ix] = g;
-                    ((int*)A->i)[ix] = state->group_to_mat_map[ir];  // row index in column
+                    Ax[ix] = g;
+                    Ai[ix] = state->group_to_mat_map[ir];  // row index in column
                     ix++;
                 }
             }
@@ -481,8 +499,8 @@ int solver_initalise_network
     // the array A->p is of length [n columns] + 1 where the last is nnz
     size_t nz = ix;
     state->nnz = nz;
-    ((int*)A->p)[i] = nz;  // for A matrix
-    ((int*)G->p)[j] = jx;  // for G matrix
+    Ap[i] = nz;  // for A matrix
+    Gp[j] = jx;  // for G matrix
 
     // now we know the actual nnz, so shead unused memory
     cholmod_reallocate_sparse(ix, A, state->common);
@@ -490,7 +508,8 @@ int solver_initalise_network
 
     // create b_set pattern
     // This is the pattern of output voltages we care about, which means we can
-    // reduce the number of multiplications
+    // reduce the number of multiplications. It doesn't store values, only indices
+    // in the b vector
     cholmod_sparse *b_set = cholmod_allocate_sparse(n_mat, 1, n_mat, true, true, 0,
                                                     CHOLMOD_PATTERN, state->common);
 
@@ -682,5 +701,5 @@ void testcase_1(size_t iter)
 
 int main ()
 {
-    testcase_1(1);
+    testcase_1(2);
 }
