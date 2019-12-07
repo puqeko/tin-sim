@@ -9,11 +9,12 @@
 #include <iostream>
 #include <vector>
 #include <tuple>
+#include <assert.h>
+#include <cmath>
+#include <queue>
 
 #define LOWER_TRIANGULAR -1
 #define UPPER_TRIANGULAR 1
-
-#define min(a, b) (((a) < (b)) ? (a) : (b))
 
 typedef struct {
     cholmod_common *common;
@@ -44,6 +45,8 @@ typedef struct {
     // steps in the solve process and reused by the cholmod api
     cholmod_dense *y;
     cholmod_dense *e;
+
+    bool should_recompute_b;  // flag used in iteration step
 } solver_state_t;
 
 // a vector or vectors each containing pairs (the row index and conductance)
@@ -60,6 +63,7 @@ typedef std::vector<std::vector<link_t> > adj_list_t;
 solver_state_t* solver_create_state()
 {
     solver_state_t* state = new solver_state_t();
+    state->should_recompute_b = false;
     state->common = new cholmod_common();
 
     // use lower triangular in the default case when storing sparse matrices.
@@ -188,7 +192,7 @@ void print_triplet(solver_state_t* state, cholmod_triplet* triplet, const char* 
     // If TRIPLET_DEBUG_LIMIT == -1, print all triplet entries. Otherwise, just
     // print up to TRIPLET_DEBUG_LIMIT number of entries
     size_t n_print;
-    if (TRIPLET_DEBUG_LIMIT > 0) n_print = min(triplet->nnz, TRIPLET_DEBUG_LIMIT);
+    if (TRIPLET_DEBUG_LIMIT > 0) n_print = std::min(triplet->nnz, TRIPLET_DEBUG_LIMIT);
     else n_print = triplet->nnz;
 
     // print each entry
@@ -224,6 +228,17 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
         printf("\n");
     }
     printf("\n");
+}
+
+void print_column_vector(solver_state_t *state, cholmod_dense *d, const char* name)
+{
+    std::cout << name << std::endl;
+    cholmod_print_dense(d, NULL, state->common);
+    double *dx = (double*)(d->x);
+    for (size_t j = 0; j < d->nrow; j++) {
+        std::cout << dx[j] << ' ';
+    }
+    std::cout << "\n" << std::endl;
 }
 
 /**
@@ -294,23 +309,23 @@ int solver_initalise_network
 )
 {
     if (n_output_groups < 1) {
-        fprintf(stderr, "If you don't specify any output voltages, then I have "
-                "nothing to calculate. Try adding some output groups.\n");
+        std::cerr << "If you don't specify any output voltages, then I have "
+                "nothing to calculate. Try adding some output groups.\n";
         return -1;
     }
 
     size_t n_groups = triplet->nrow;  // ie, the total number of groups
 
     if (n_input_groups == n_groups) {
-        fprintf(stderr, "Nothing to do. All the voltages are known.\n");
+        std::cerr << "Nothing to do. All the voltages are known.\n";
         return -1;
     }
 
     // see main comment above
     if (n_input_groups < 2) {
-        fprintf(stderr, "Warning: You probably intended to specify more than one "
+        std::cerr << "Warning: You probably intended to specify more than one "
                 "input voltage. All the voltages will be the same otherwise. "
-                "Try adding some input groups.\n");
+                "Try adding some input groups.\n";
         // still try it though, just a warning
     }
     
@@ -356,15 +371,15 @@ int solver_initalise_network
     // we keep two lists so that the values remain in order and sorted
     for (size_t ig = 0, it = 0; ig < n_groups; ig++) {
         // placeholder for diagonals only in column wise one
-        adj_c[ig].push_back(std::make_pair(ig, 0.0));
+        adj_c[ig].emplace_back(ig, 0.0);
         while (it < nnz && (size_t)(((int*)triplet->j)[it]) == ig) {
             // append row index and conductance value to column vector
             size_t irow = ((int*)triplet->i)[it];
             double cond = ((double*)triplet->x)[it];
             // -ve off diagonals by convension
             // do both directions, stored in seporate adj lists
-            adj_c[ig].push_back(std::make_pair(irow, -cond));
-            adj_r[irow].push_back(std::make_pair(ig, -cond));
+            adj_c[ig].emplace_back(irow, -cond);
+            adj_r[irow].emplace_back(ig, -cond);
             it++;
         }
     }
@@ -390,8 +405,8 @@ int solver_initalise_network
         }
     }
 
-    // print_adj(adj_c, "Column wise adjacancy:");
-    // print_adj(adj_r, "Row wise adjacancy:");
+    print_adj(adj_c, "Column wise adjacancy:");
+    print_adj(adj_r, "Row wise adjacancy:");
 
     // A matrix size
     size_t n_mat = n_groups - n_input_groups;
@@ -514,22 +529,21 @@ int solver_initalise_network
                                                     CHOLMOD_PATTERN, state->common);
 
     state->b_set = b_set;
-    int *b_set_p = (int*)(b_set->p);
-    int *b_set_i = (int*)(b_set->i);
+    int *b_set_p = (int*)(b_set->p);  // column pointers
+    int *b_set_i = (int*)(b_set->i);  // row indices
 
     // std::sort(output_groups, output_groups + n_output_groups);
     b_set_p[0] = 0;  // point to first column
-    ig = 0;
-    i = 0;
+    ig = 0;  // group index
+    i = 0;  // b index
     for(; ig < n_output_groups; ig++) {
         if (!state->is_input[output_groups[ig]]) {
+            // since b is in matrix dimensions, we must map the output groups
             b_set_i[i] = state->group_to_mat_map[output_groups[ig]];
             i++;
         }
     }
     b_set_p[1] = i;  // nnz
-
-    print_sparse(state, state->b_set, "b_set");
 
     return 0;
 }
@@ -569,6 +583,131 @@ int solver_begin(solver_state_t *state)
 
     return 0;
 }
+
+/**
+ * Accept a list of pairs to be converted to a sparse matrix C then used to
+ * update or downdate the decomposition of A and the G matrix.
+ * */
+int updowndate(solver_state_t *state, const std::priority_queue<link_t> &q, bool is_update)
+{
+    // make update and downdate matrices
+    size_t memory = std::min(state->n_mat, q.size());
+    cholmod_sparse* C = cholmod_allocate_sparse(state->n_mat, 1, memory,
+                    true, true, 0, CHOLMOD_REAL, state->common);
+
+    // set flag to recompute b
+}
+
+/**
+ * Solve a system where the input voltages are fixed values.
+ * */
+int solver_iterate_dc(const size_t n_iters, cholmod_triplet* connections,
+                      const int* input_groups, const double* input_voltages,
+                      const size_t n_inputs, const int* output_groups,
+                      const size_t n_outputs, update_func_t update_func)
+{
+    size_t n_groups = connections->nrow;
+    assert(n_inputs <= n_groups);
+    assert(n_outputs <= n_groups);
+
+    solver_state_t* state = solver_create_state();
+
+    // Initalise the solver. This will construct the A matrix and b vector used
+    // to represent the system.
+    solver_initalise_network(state, connections,
+                             input_groups, n_inputs,
+                             output_groups, n_outputs);
+
+    solver_begin(state);
+
+    // populate fixed voltages
+    cholmod_dense *v = cholmod_zeros(n_inputs, 1, CHOLMOD_REAL, state->common);
+    delete v->x; v->x = (void*)input_voltages;  // replace data array for matrix
+
+    // since the voltages are fixed, we can pre-compute the b vector
+    double alpha[] = {1, 1};
+    double beta[] = {0, 0};  // pre multipliers we don't care about
+    // compute b matrix
+    // b = alpha*(A*x) + beta*b
+    cholmod_sdmult(state->G, false, alpha, beta, v, state->b, state->common);
+
+    for (size_t i = 0; i < n_iters; i++) {
+        // solve the system
+        cholmod_solve2(CHOLMOD_A, state->LD, state->b, state->b_set, &state->x,
+                       &state->x_set, &state->y, &state->e, state->common);
+        // get updates if there are any this iteration
+        // don't do any calculations if not
+        cholmod_triplet *updates;
+        do {
+            // triplet doesn't need to be sorted
+            update_func(&updates);
+        } while (updates->nnz == 0 && i++ < n_iters);
+
+        // pointers to update triplet
+        int *Ui = (int*)(U->i);
+        int *Uj = (int*)(U->j);
+        double *Ux = (double*)(U->x);
+
+        // use priority queues so that we can pull them off the queue in order
+        std::priority_queue<link_t> update;
+        std::priority_queue<link_t> downdate;
+        for (int i = 0; i < updates->nnz; i++){
+            int &r = Ui[i];
+            int &c = Uj[i];
+            double &g = Ux[i];
+
+            // calculate the root and decide if update or downdate is needed
+            // ie, calculate root so that
+            // A + C*C^T gives our new A (for update) or
+            // A - C*C^T gives are new A (for downdate)
+            // update the correct conductance values in the matrix
+            // see implimentation document for details
+            double root_g = std::sqrt(std::abs(g));
+            std::priority_queue<link_t> &q = (g > 0) ? update : downdate;
+            q.emplace(c, g);  // add pair onto queue (column index, conductance)
+            q.emplace(r, -g);
+        }
+
+        // call helper to update / downdate the decomposition as required
+        updowndate(state, update, true);
+        updowndate(state, downdate, false);
+
+        if (state->should_recompute_b) {
+            // TODO: recompute b
+        }
+
+        // make some assertions about symmetry, type, etc of triplet
+        if (updates->ncol != updates->nrow || updates->stype != LOWER_TRIANGULAR ||
+            updates->xtype != CHOLMOD_REAL) {
+            fprintf(stderr, "Update triplet must be symmetric, lower triangular, "
+                            "and of type float.\nDEBUG INFO: %ldx%ld mat, stype:%d, "
+                            "xtype:%d\n",
+                    updates->ncol, updates->nrow, updates->stype, updates->xtype);
+            return -1;
+        }
+
+        if (updates->ncol != state->n_mat) {
+            std::cerr << "Update triplet must have dimensions n_mat (n_groups - n_inputs).\n";
+            return -1;
+        }
+    }
+
+    solver_destroy_state(state);
+
+}
+
+/**
+ * Solve a system where the input voltages change at each timestep, as computed
+ * by a callback function.
+ * */
+// int solver_iterate_ac(size_t n_iters, cholmod_triplet* connections,
+//                       double* input_groups, size_t n_inputs,
+//                       double* output_groups, size_t n_outputs,
+//                       voltage_func_t voltage_func, update_func_t update_func)
+// {
+    
+// }
+
 
 /**
  * Read in a .mtx file. The file must be in symmetric lower triangular real
@@ -629,7 +768,7 @@ void testcase_0()
     int input_groups[] = {1, 2}; int n_inputs = 2;  // set v_1 and v_2 as known
     int output_groups[] = {0, 1, 2, 3}; int n_ouputs = 4;  // get all voltages
 
-    // Initalise the solver. This will construct the A matrix and b vector used
+    // Initalise the solver. This will construct the A matrix and G matrx used
     // to represent the system.
     solver_initalise_network(state, triplet,
                              &input_groups[0], n_inputs,
@@ -637,6 +776,7 @@ void testcase_0()
 
     print_sparse(state, state->A, "A");
     print_sparse(state, state->G, "G");
+    print_sparse(state, state->b_set, "b_set");
 
     solver_destroy_state(state);
     // state can no longer be used
@@ -664,6 +804,7 @@ void testcase_1(size_t iter)
 
     print_sparse(state, state->A, "A");
     print_sparse(state, state->G, "G");
+    print_sparse(state, state->b_set, "b_set");
 
     solver_begin(state);
 
@@ -673,27 +814,17 @@ void testcase_1(size_t iter)
     for (size_t i = 0; i < 2; i++) vx[i] = known_voltages[i];
 
     for (size_t i = 0; i < iter; i++) {
+        std::cout << "-- iteration " << i << " --" << std::endl;
         // compute b matrix
         // b = alpha*(A*x) + beta*b
         double alpha[] = {1, 1};
         double beta[] = {0, 0};
         cholmod_sdmult(state->G, false, alpha, beta, v, state->b, state->common);
-        cholmod_print_dense(state->b, NULL, state->common);
-        double *bx = (double*)(state->b->x);
-        for (size_t j = 0; j < state->n_mat; j++) {
-            std::cout << bx[j] << ' ';
-        }
-        std::cout << std::endl;
+        print_column_vector(state, state->b, "b vector");
 
         cholmod_solve2(CHOLMOD_A, state->LD, state->b, state->b_set, &state->x,
                        &state->x_set, &state->y, &state->e, state->common);
-        
-        cholmod_print_dense(state->x, NULL, state->common);
-        double *xx = (double*)(state->x->x);
-        for (size_t j = 0; j < state->n_mat; j++) {
-            std::cout << xx[j] << ' ';
-        } 
-        std::cout << std::endl;
+        print_column_vector(state, state->x, "x vector");
     }
 
     solver_destroy_state(state);
@@ -701,5 +832,5 @@ void testcase_1(size_t iter)
 
 int main ()
 {
-    testcase_1(2);
+    testcase_0();
 }
