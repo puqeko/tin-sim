@@ -588,12 +588,30 @@ int solver_begin(solver_state_t *state)
  * Accept a list of pairs to be converted to a sparse matrix C then used to
  * update or downdate the decomposition of A and the G matrix.
  * */
-int updowndate(solver_state_t *state, const std::priority_queue<link_t> &q, bool is_update)
+void updowndate(solver_state_t *state, std::priority_queue<link_t> &q, bool is_update)
 {
+    if (q.empty()) return;
+
     // make update and downdate matrices
     size_t memory = std::min(state->n_mat, q.size());
     cholmod_sparse* C = cholmod_allocate_sparse(state->n_mat, 1, memory,
                     true, true, 0, CHOLMOD_REAL, state->common);
+
+    int* Cp = (int*)(C->p);
+    int* Ci = (int*)(C->i);
+    double* Cx = (double*)(C->x);
+
+    // populate matrix
+    Cp[0] = 0;
+    int ix = 0;  // matrix data index
+    while (!q.empty()) {
+        auto &pair = q.top();
+        Ci[ix] = pair.first;
+        Cx[ix] = pair.second;
+        q.pop();
+        ix++;
+    }
+    Cp[1] = ix;  // number of non-zeros
 
     // set flag to recompute b
 }
@@ -647,6 +665,14 @@ int solver_iterate_dc(const size_t n_iters, cholmod_triplet* connections,
         int *Ui = (int*)(U->i);
         int *Uj = (int*)(U->j);
         double *Ux = (double*)(U->x);
+
+        /* rank of maximum update/downdate. Valid values: *2,4,or8. Avalue<2issetto2,anda
+        * value > 8 is set to 8. It is then rounded up to the next highest
+        * power of 2, if not already a power of 2. Workspace (Xwork, below) of * size nrow-by-maxrank double’s is allocated for the update/downdate.
+        * If an update/downdate of rank-k is requested, with k > maxrank,
+        * it is done in steps of maxrank. Default: 8, which is fastest.
+        * Memory usage can be reduced by setting maxrank to 2 or 4.
+        */
 
         // use priority queues so that we can pull them off the queue in order
         std::priority_queue<link_t> update;
