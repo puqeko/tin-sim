@@ -11,10 +11,14 @@
 #include <tuple>
 #include <assert.h>
 #include <cmath>
-#include <queue>
+#include <algorithm>
 
 #define LOWER_TRIANGULAR -1
 #define UPPER_TRIANGULAR 1
+
+// Every DECOMPOSITION_FREQUENCY iterations, we recalculate the LDL decomposition
+// from the A matrix.
+#define DECOMPOSITION_FREQUENCY 1000
 
 typedef struct {
     cholmod_common *common;
@@ -28,8 +32,9 @@ typedef struct {
     size_t nnz;  // number of non-zero values in A
 
     // since the matrix doesn't contain input groups (knowns), we need mappings
-    size_t *group_to_mat_map;  // mapping from group index to matrix index
-    size_t *mat_to_group_map;  // mapping from matrix index to group index
+    size_t *group_to_mat_map;  // mapping from group index to A matrix index
+    size_t *mat_to_group_map;  // mapping from A matrix index to group index
+    size_t *group_to_g_map;  // mapping from group index to G matrix index
     size_t n_mat;  // matrix size (should be n_groups - n_input_groups) size(A)
 
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
@@ -45,8 +50,6 @@ typedef struct {
     // steps in the solve process and reused by the cholmod api
     cholmod_dense *y;
     cholmod_dense *e;
-
-    bool should_recompute_b;  // flag used in iteration step
 } solver_state_t;
 
 // a vector or vectors each containing pairs (the row index and conductance)
@@ -63,7 +66,6 @@ typedef std::vector<std::vector<link_t> > adj_list_t;
 solver_state_t* solver_create_state()
 {
     solver_state_t* state = new solver_state_t();
-    state->should_recompute_b = false;
     state->common = new cholmod_common();
 
     // use lower triangular in the default case when storing sparse matrices.
@@ -183,7 +185,7 @@ void print_adj(const adj_list_t &adj_c, const char *name)
      std::cout << "\n";
 }
 
-#define TRIPLET_DEBUG_LIMIT 10
+#define TRIPLET_DEBUG_LIMIT ((size_t) 10)
 void print_triplet(solver_state_t* state, cholmod_triplet* triplet, const char* name)
 {
     printf("%s:\n", name);
@@ -415,17 +417,22 @@ int solver_initalise_network
     // map from group index to matrix index
     state->group_to_mat_map = new size_t[n_groups];
     state->mat_to_group_map = new size_t[n_mat];
+    state->group_to_g_map = new size_t[n_groups];
 
     size_t ig = 0;  // current group index
-    size_t i = 0;  // current matrix index
+    size_t i = 0;  // current A matrix index
+    size_t j = 0;  // current G matrix index
     for (; ig < n_groups; ig++) {
         if (state->is_input[ig]) {
             // mark as input group
             state->group_to_mat_map[ig] = -1;
+            state->group_to_g_map[ig] = j;
+            j++;
         } else {
             // create group mapping from group index to matrix index and visa versa
             state->group_to_mat_map[ig] = i;
             state->mat_to_group_map[i] = ig;
+            state->group_to_g_map[ig] = -1;
             i++;  // next matrix index
         }
     }
@@ -563,8 +570,6 @@ int solver_begin(solver_state_t *state)
 
     // get symbolic factor and compute permutation
     state->LD = cholmod_analyze(state->A, state->common);
-    // get actual factorisation for LDLT
-    cholmod_factorize(state->A, state->LD, state->common);
 
     // vectors allocated for the injected current vector b and solution vector x
     // each vector is stored in dense form with a sparse pattern which tells
@@ -584,48 +589,91 @@ int solver_begin(solver_state_t *state)
     return 0;
 }
 
-/**
- * Accept a list of pairs to be converted to a sparse matrix C then used to
- * update or downdate the decomposition of A and the G matrix.
- * */
-void updowndate(solver_state_t *state, std::priority_queue<link_t> &q, bool is_update)
+// lookup time is O(log n) where n is the number of non-zeros in the cth column
+int _update_mat(cholmod_sparse* A, size_t& r, size_t& c, double& dg)
 {
-    if (q.empty()) return;
-
-    // make update and downdate matrices
-    size_t memory = std::min(state->n_mat, q.size());
-    cholmod_sparse* C = cholmod_allocate_sparse(state->n_mat, 1, memory,
-                    true, true, 0, CHOLMOD_REAL, state->common);
-
-    int* Cp = (int*)(C->p);
-    int* Ci = (int*)(C->i);
-    double* Cx = (double*)(C->x);
-
-    // populate matrix
-    Cp[0] = 0;
-    int ix = 0;  // matrix data index
-    while (!q.empty()) {
-        auto &pair = q.top();
-        Ci[ix] = pair.first;
-        Cx[ix] = pair.second;
-        q.pop();
-        ix++;
+    if (c >= A->ncol || r >= A->nrow) {
+        return -1;  // the row/col is outside A
     }
-    Cp[1] = ix;  // number of non-zeros
 
-    // set flag to recompute b
+    // get sparse pointers to A matrix
+    int *Ap = (int*)(A->p);
+    int *Ai = (int*)(A->i);
+    double *Ax = (double*)(A->x);
+
+    // get pointers to the columns start and end in the i and x arrays
+    int *rstart = &Ai[Ap[c]];  // inclusive
+    int *rend = &Ai[Ap[c+1]];  // exclusive
+    // do a binary search on this column
+    int *i = std::lower_bound(rstart, rend, r);
+    int index = i-Ai;  // index of the conductance value in i and x
+    if (index >= Ap[c+1] || index < Ap[c] || *i != r) {
+        return -2;  // the row/col is non-zero, which can't be updated
+    }
+    // update the matrix entry with a change in conductance
+    Ax[index] += dg;
+    return 0;
 }
 
 /**
- * Solve a system where the input voltages are fixed values.
+ * Add a column to the sparse update matrix C. Each column has two values at
+ * index r and index c such that the connection between c and r are updated in LD
+ * to reflect the same update in A.
  * */
-int solver_iterate_dc(const size_t n_iters, cholmod_triplet* connections,
-                      const int* input_groups, const double* input_voltages,
-                      const size_t n_inputs, const int* output_groups,
-                      const size_t n_outputs, update_func_t update_func)
+void _add_update_col
+(
+    solver_state_t* state,
+    int* Cp, int* Ci, double* Cx,  // update matrix pointers
+    size_t& i,  // data index
+    size_t& r,  // row index (in group indicies)
+    size_t& c,  // column index (in group indicies)
+    double& dg  // change in conductance
+)
+{
+    // At this point we have alread decided if this is a downdate or update so
+    // it is safe to take the abs of dg. Take the root so that when multipling
+    // out we get dg back
+    double rootdg = std::sqrt(std::abs(dg));
+    Cp[i] = i*2;  // we add two datapoints for each new column
+    Ci[i*2] = state->group_to_mat_map[r];  // convert to matrix indicies
+    Ci[i*2+1] = state->group_to_mat_map[c];  // convert to matrix indicies
+
+    // Will add a +ve dg to the diagonals and -ve dg to the off diagonals once
+    // multiplied out and added to A. This corrisponds to updating the conductance
+    // between group r and c as well as the mutral conductance on the diagonal
+    Cx[i*2] = rootdg;
+    Cx[i*2+1] = -rootdg;
+}
+
+void _updown(solver_state_t* state, cholmod_sparse* U, bool isupdate)
+{
+    cholmod_sparse *Uperm;  // permute U into LD ordering
+    Uperm = cholmod_submatrix(U, (int*)(state->LD->Perm), state->LD->n,
+                                NULL, -1, true, true, state->common);
+    cholmod_updown(isupdate, U, state->LD, state->common);
+    cholmod_free_sparse(&Uperm, state->common);
+}
+
+// pointer to update function
+typedef cholmod_triplet solver_triplet;
+typedef int (*update_func_t)(solver_state_t*, solver_triplet*, double*, int i);
+
+/**
+ * Solve a system where the input voltages can vary with time.
+ * */
+int solver_iterate_ac
+(
+    const size_t n_iters,
+    solver_triplet* connections,
+    const int* input_groups,
+    const size_t n_input_groups,
+    const int* output_groups,
+    const size_t n_outputs,
+    update_func_t update_func
+)
 {
     size_t n_groups = connections->nrow;
-    assert(n_inputs <= n_groups);
+    assert(n_input_groups <= n_groups);
     assert(n_outputs <= n_groups);
 
     solver_state_t* state = solver_create_state();
@@ -633,106 +681,195 @@ int solver_iterate_dc(const size_t n_iters, cholmod_triplet* connections,
     // Initalise the solver. This will construct the A matrix and b vector used
     // to represent the system.
     solver_initalise_network(state, connections,
-                             input_groups, n_inputs,
+                             input_groups, n_input_groups,
                              output_groups, n_outputs);
 
     solver_begin(state);
 
-    // populate fixed voltages
-    cholmod_dense *v = cholmod_zeros(n_inputs, 1, CHOLMOD_REAL, state->common);
-    delete v->x; v->x = (void*)input_voltages;  // replace data array for matrix
+    const size_t UPDATE_LIMIT = state->nnz / 2;
+    // This is an arbitrary cutoff at this point. We need to test
+    // at how many updates it nolonger becomes worthwhile to update
+    // LD directly and instead we may as well recompute the LDL
+    // decomposition. The nnz of conductance_deltas is the number of
+    // rank updates to A. CHOLMOD will only compute 8 updates at a time
+    // so it might be worth limiting to some multiple of 8. Memory usage
+    // can also be reduced by reducing the number of updates cholmod does
+    // to 2 or 4.
+    // TODO: Run some imperical tests to determe a good value at which
+    // the number of updates is too large to updatedowndate the LDL
+    // factor.
 
-    // since the voltages are fixed, we can pre-compute the b vector
+    // populate fixed voltages
+    cholmod_dense *v = cholmod_ones(n_input_groups, 1, CHOLMOD_REAL, state->common);
+    // delete v->x; v->x = (void*)input_groups;  // replace data array for matrix
+
+    // allocate space for update matrices
+    // An update matrix is such that A + UU^T = new A
+    cholmod_sparse* U = cholmod_allocate_sparse(state->n_mat, state->nnz,
+    //          use nnz*2 since two values needed per column update
+                state->nnz*2, true, true, 0, CHOLMOD_REAL, state->common);
+    // downdate sparse matrix pointers
+    int *Up = (int*)(U->p);
+    int *Ui = (int*)(U->i);
+    double *Ux = (double*)(U->x);
+
+    // An update matrix is such that A - DD^T = new A
+    cholmod_sparse* D = cholmod_allocate_sparse(state->n_mat, state->nnz,
+    //          use UPDATE_LIMIT*2 since two values needed per column update
+                UPDATE_LIMIT*2, true, true, 0, CHOLMOD_REAL, state->common);
+    // downdate sparse matrix pointers
+    int *Dp = (int*)(D->p);
+    int *Di = (int*)(D->i);
+    double *Dx = (double*)(D->x);
+
     double alpha[] = {1, 1};
     double beta[] = {0, 0};  // pre multipliers we don't care about
-    // compute b matrix
-    // b = alpha*(A*x) + beta*b
-    cholmod_sdmult(state->G, false, alpha, beta, v, state->b, state->common);
+
+    // do all computations on first iteration
+    bool should_recompute_LD = true;  // recompute LD from A
+
+    // triplet for updating each iteration
+    cholmod_triplet *conductance_deltas;
+    cholmod_allocate_triplet(n_groups, n_groups, state->nnz, LOWER_TRIANGULAR,
+                             CHOLMOD_REAL, state->common);
 
     for (size_t i = 0; i < n_iters; i++) {
+        if (should_recompute_LD) {
+            // get actual factorisation for LDLT
+            cholmod_factorize(state->A, state->LD, state->common);
+            should_recompute_LD = false;
+        }
+
+        // compute b matrix
+        // b = alpha*(A*x) + beta*b
+        cholmod_sdmult(state->G, false, alpha, beta, v, state->b, state->common);
+
         // solve the system
         cholmod_solve2(CHOLMOD_A, state->LD, state->b, state->b_set, &state->x,
                        &state->x_set, &state->y, &state->e, state->common);
+
         // get updates if there are any this iteration
         // don't do any calculations if not
-        cholmod_triplet *updates;
-        do {
-            // triplet doesn't need to be sorted
-            update_func(&updates);
-        } while (updates->nnz == 0 && i++ < n_iters);
+        // assume triplet is lower triangular
+        // triplet doesn't need to be sorted
+        conductance_deltas->nnz = 0;  // reset size (overwrite)
 
-        // pointers to update triplet
-        int *Ui = (int*)(U->i);
-        int *Uj = (int*)(U->j);
-        double *Ux = (double*)(U->x);
-
-        /* rank of maximum update/downdate. Valid values: *2,4,or8. Avalue<2issetto2,anda
-        * value > 8 is set to 8. It is then rounded up to the next highest
-        * power of 2, if not already a power of 2. Workspace (Xwork, below) of * size nrow-by-maxrank double’s is allocated for the update/downdate.
-        * If an update/downdate of rank-k is requested, with k > maxrank,
-        * it is done in steps of maxrank. Default: 8, which is fastest.
-        * Memory usage can be reduced by setting maxrank to 2 or 4.
-        */
-
-        // use priority queues so that we can pull them off the queue in order
-        std::priority_queue<link_t> update;
-        std::priority_queue<link_t> downdate;
-        for (int i = 0; i < updates->nnz; i++){
-            int &r = Ui[i];
-            int &c = Uj[i];
-            double &g = Ux[i];
-
-            // calculate the root and decide if update or downdate is needed
-            // ie, calculate root so that
-            // A + C*C^T gives our new A (for update) or
-            // A - C*C^T gives are new A (for downdate)
-            // update the correct conductance values in the matrix
-            // see implimentation document for details
-            double root_g = std::sqrt(std::abs(g));
-            std::priority_queue<link_t> &q = (g > 0) ? update : downdate;
-            q.emplace(c, g);  // add pair onto queue (column index, conductance)
-            q.emplace(r, -g);
-        }
-
-        // call helper to update / downdate the decomposition as required
-        updowndate(state, update, true);
-        updowndate(state, downdate, false);
-
-        if (state->should_recompute_b) {
-            // TODO: recompute b
+        // passed in update function
+        // fills out the conductance_deltas triplet and gives us a voltage vector
+        int code = update_func(state, conductance_deltas, (double*)(v->x), i);
+        if (code < 0) {
+            std::cerr << "Update failed with code " << code << std::endl;
+            return -1;
         }
 
         // make some assertions about symmetry, type, etc of triplet
-        if (updates->ncol != updates->nrow || updates->stype != LOWER_TRIANGULAR ||
-            updates->xtype != CHOLMOD_REAL) {
+        if (conductance_deltas->ncol != conductance_deltas->nrow ||
+            conductance_deltas->stype != LOWER_TRIANGULAR ||
+            conductance_deltas->xtype != CHOLMOD_REAL) {
             fprintf(stderr, "Update triplet must be symmetric, lower triangular, "
                             "and of type float.\nDEBUG INFO: %ldx%ld mat, stype:%d, "
                             "xtype:%d\n",
-                    updates->ncol, updates->nrow, updates->stype, updates->xtype);
+                    conductance_deltas->ncol, conductance_deltas->nrow,
+                    conductance_deltas->stype, conductance_deltas->xtype);
             return -1;
         }
 
-        if (updates->ncol != state->n_mat) {
+        if (conductance_deltas->ncol != state->n_mat) {
             std::cerr << "Update triplet must have dimensions n_mat (n_groups - n_inputs).\n";
             return -1;
         }
+
+        // decide between updating LD or making a new one
+        if (conductance_deltas->nnz >= UPDATE_LIMIT) {
+            should_recompute_LD = true;
+            // In this case, we could come up with better ways to update the
+            // sparse matrix A. We could iterate through each index sequentally,
+            // but this would require the triplet to be in order as in
+            // solver_initalise_network.
+        }
+
+        // recalculate every now and again according to DECOMPOSITION_FREQUENCY
+        if (i % DECOMPOSITION_FREQUENCY == DECOMPOSITION_FREQUENCY - 1) {
+            should_recompute_LD = true;
+        }
+
+        // pointers to update triplet
+        int *Ci = (int*)(conductance_deltas->i);
+        int *Cj = (int*)(conductance_deltas->j);
+        double *Cx = (double*)(conductance_deltas->x);
+
+        // column index in update matrix
+        // the data index is simply 2*iu since each column has only 2 values
+        size_t iu = 0;
+        Up[U->ncol] = 0;  // reset number of non-zeros, used by cholmod
+
+        // column index in downdate matrix
+        // the data index is simply 2*id since each column has only 2 values
+        size_t id = 0;
+        Up[U->ncol] = 0;  // reset number or non-zeros, used by cholmod
+
+        bool can_update = false;  // set true if U is added to
+        bool can_downdate = false;  // set true if D is added to
+
+        for (int j = 0; j < conductance_deltas->nnz; j++) {
+            // triplet pointers
+            size_t irow = (size_t) Ci[j];
+            size_t icol = (size_t) Cj[j];
+            double &dg = Cx[j];  // update to conductance between link
+
+            // update the A and G matricies
+            // since we might need to rebuild LD from A and we might need to
+            // recompute b
+            int res;
+            if (state->is_input[icol]) {
+                // update a G sparse matrix value where G is n_mat * n_input_groups
+                res = _update_mat(state->G, state->group_to_mat_map[irow], state->group_to_g_map[icol], dg);
+                // if we can't find a value in the sparse matrix to update
+                if (res < 0) {
+                    std::cout << "Cannot update zero values in G matrix." << std::endl;
+                    return -1;
+                }
+            } else {
+                // update a A sparse matrix value where A is n_mat * n_mat
+                res = _update_mat(state->A, state->group_to_mat_map[irow], state->group_to_mat_map[icol], dg);
+
+                // if we can't find a value in the sparse matrix to update
+                if (res < 0) {
+                    std::cout << "Cannot update zero values in A matrix." << std::endl;
+                    return -1;
+                }
+
+                // construct the sparse matricies for updown dating LD for A
+                if (!should_recompute_LD) {
+                    if (dg < 0) {
+                        // downdate column
+                        can_downdate = true;
+                        _add_update_col(state, Dp, Di, Dx, id, irow, icol, dg);
+                        id++;
+                    } else {
+                        // update column
+                        can_update = true;
+                        _add_update_col(state, Up, Ui, Ux, iu, irow, icol, dg);
+                        iu++;
+                    }
+                }
+            }
+        }
+        Dp[id] = id*2; D->ncol = id;  // length of sparse matrix D as last index
+        Up[iu] = iu*2; U->ncol = iu;  // length of sparse matrix U as last index
+
+        if (!should_recompute_LD) {
+            // update / downdate the decomposition as required
+            if (can_update) _updown(state, U, true);
+            if (can_downdate) _updown(state, D, false);
+        }
     }
 
+    // free the memory used by the update triplet
+    cholmod_free_triplet(&conductance_deltas, state->common);
+
     solver_destroy_state(state);
-
 }
-
-/**
- * Solve a system where the input voltages change at each timestep, as computed
- * by a callback function.
- * */
-// int solver_iterate_ac(size_t n_iters, cholmod_triplet* connections,
-//                       double* input_groups, size_t n_inputs,
-//                       double* output_groups, size_t n_outputs,
-//                       voltage_func_t voltage_func, update_func_t update_func)
-// {
-    
-// }
 
 
 /**
