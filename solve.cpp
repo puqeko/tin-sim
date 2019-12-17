@@ -1,10 +1,11 @@
-/* cholesky.cpp */
+/* solve.cpp */
 
-#include <stdint.h>
-#include <stdbool.h>
+extern "C" {
+    #include <cholmod.h>
+}
+
+#include "solve.h"
 #include <stdlib.h>
-#include <cholmod.h>
-#include "sort_r.h"  // cause qsort_r works different between operating systems
 
 #include <iostream>
 #include <vector>
@@ -15,42 +16,6 @@
 
 #define LOWER_TRIANGULAR -1
 #define UPPER_TRIANGULAR 1
-
-// Every DECOMPOSITION_FREQUENCY iterations, we recalculate the LDL decomposition
-// from the A matrix.
-#define DECOMPOSITION_FREQUENCY 1000
-
-typedef struct {
-    cholmod_common *common;
-
-    // lookup table: is_input[i] is true if group i is an input else it is false
-    bool *is_input;
-    bool *is_output;  // same as for input, but these are the output nodes
-    size_t n_input_groups;
-    size_t n_output_groups;
-    size_t n_groups;  // use int over size_t for consistancy with cholmod
-    size_t nnz;  // number of non-zero values in A
-
-    // since the matrix doesn't contain input groups (knowns), we need mappings
-    size_t *group_to_mat_map;  // mapping from group index to A matrix index
-    size_t *mat_to_group_map;  // mapping from A matrix index to group index
-    size_t *group_to_g_map;  // mapping from group index to G matrix index
-    size_t n_mat;  // matrix size (should be n_groups - n_input_groups) size(A)
-
-    // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
-    cholmod_sparse *A;  // the full conductance matrix
-    cholmod_sparse *G;  // matrix of conductances on the right-hand-side
-    cholmod_factor *LD;  // the LD decomposition
-    cholmod_dense *b;  // vector of injected currents b = G v [known voltages]
-    cholmod_sparse *b_set;  // pattern of groups which have injected currents
-    cholmod_dense *x;  // vector of solved voltages
-    cholmod_sparse *x_set;  // pattern of groups voltages with defined solutions
-
-    // vectors of length N, if A is NxN, which are allocated for intermediate
-    // steps in the solve process and reused by the cholmod api
-    cholmod_dense *y;
-    cholmod_dense *e;
-} solver_state_t;
 
 // a vector or vectors each containing pairs (the row index and conductance)
 typedef std::pair<size_t, double> link_t;
@@ -185,7 +150,6 @@ void print_adj(const adj_list_t &adj_c, const char *name)
      std::cout << "\n";
 }
 
-#define TRIPLET_DEBUG_LIMIT ((size_t) 10)
 void print_triplet(solver_state_t* state, cholmod_triplet* triplet, const char* name)
 {
     printf("%s:\n", name);
@@ -352,13 +316,15 @@ int solver_initalise_network
     // make set of input and output groups for faster O(1) lookup
     if (!state->is_input)
         state->is_input = new bool[n_groups]();
-    for (size_t i = 0; i < n_input_groups; i++) {
+    size_t i = 0;
+    for (; i < n_input_groups; i++) {
         // assume that the group indices are not out of bounds 
         state->is_input[input_groups[i]] = true;
     }
     if (!state->is_output)
         state->is_output = new bool[n_groups]();
-    for (size_t i =0; i < n_output_groups; i++) {
+    i = 0;
+    for (; i < n_output_groups; i++) {
         state->is_output[output_groups[i]] = true;
     }
 
@@ -391,7 +357,8 @@ int solver_initalise_network
 
     // sum conductances for diagonal entries
     // use -= since we are summing -ve entries but want a +ve diagonal
-    for (size_t i = 0; i < n_groups; i++) {
+    i = 0;
+    for (; i < n_groups; i++) {
         // column wise
         for (auto &pair : adj_c[i]) {
             double &cond = pair.second;
@@ -420,7 +387,7 @@ int solver_initalise_network
     state->group_to_g_map = new size_t[n_groups];
 
     size_t ig = 0;  // current group index
-    size_t i = 0;  // current A matrix index
+    i = 0;  // current A matrix index
     size_t j = 0;  // current G matrix index
     for (; ig < n_groups; ig++) {
         if (state->is_input[ig]) {
@@ -456,7 +423,7 @@ int solver_initalise_network
     size_t jx = 0;  // current G matrix value index 
     ig = 0;  // current group
     i = 0;  // current matrix index A (unknown)
-    size_t j = 0;  // current matrix index G (input)
+    j = 0;  // current matrix index G (input)
 
     // get pointers to sparse storage elements of A and G for compressed col form
     int* Gp = (int*)(G->p);
@@ -607,7 +574,7 @@ int _update_mat(cholmod_sparse* A, size_t& r, size_t& c, double& dg)
     // do a binary search on this column
     int *i = std::lower_bound(rstart, rend, r);
     int index = i-Ai;  // index of the conductance value in i and x
-    if (index >= Ap[c+1] || index < Ap[c] || *i != r) {
+    if (index >= Ap[c+1] || index < Ap[c] || *i != (int)r) {
         return -2;  // the row/col is non-zero, which can't be updated
     }
     // update the matrix entry with a change in conductance
@@ -654,29 +621,25 @@ void _updown(solver_state_t* state, cholmod_sparse* U, bool isupdate)
     cholmod_free_sparse(&Uperm, state->common);
 }
 
-// pointer to update function
-typedef cholmod_triplet solver_triplet;
-typedef int (*update_func_t)(solver_state_t*, solver_triplet*, double*, int i);
-
 /**
  * Solve a system where the input voltages can vary with time.
  * */
 int solver_iterate_ac
 (
+    solver_state_t *state,
     const size_t n_iters,
-    solver_triplet* connections,
+    solver_triplet_t* connections,
     const int* input_groups,
     const size_t n_input_groups,
     const int* output_groups,
     const size_t n_outputs,
-    update_func_t update_func
+    update_func_t update_func,
+    void* data
 )
 {
     size_t n_groups = connections->nrow;
     assert(n_input_groups <= n_groups);
     assert(n_outputs <= n_groups);
-
-    solver_state_t* state = solver_create_state();
 
     // Initalise the solver. This will construct the A matrix and b vector used
     // to represent the system.
@@ -701,7 +664,7 @@ int solver_iterate_ac
 
     // populate fixed voltages
     cholmod_dense *v = cholmod_ones(n_input_groups, 1, CHOLMOD_REAL, state->common);
-    // delete v->x; v->x = (void*)input_groups;  // replace data array for matrix
+    // delete (double*)(v->x); v->x = (void*)input_groups;  // replace data array for matrix
 
     // allocate space for update matrices
     // An update matrix is such that A + UU^T = new A
@@ -756,7 +719,16 @@ int solver_iterate_ac
 
         // passed in update function
         // fills out the conductance_deltas triplet and gives us a voltage vector
-        int code = update_func(state, conductance_deltas, (double*)(v->x), i);
+        double *voltages = (double*)(v->x);
+        int code = update_func(state, conductance_deltas, &voltages, i, data);
+        if (voltages != (double*)(v->x)) {
+            // we changed this to point to new data
+            // we must free the data origonally allocated
+            // the new data pointed to will be freed at the end of this call
+            delete (double*)(v->x);
+            v->x = (void*) voltages;
+        }
+        
         if (code < 0) {
             std::cerr << "Update failed with code " << code << std::endl;
             return -1;
@@ -811,7 +783,7 @@ int solver_iterate_ac
         bool can_update = false;  // set true if U is added to
         bool can_downdate = false;  // set true if D is added to
 
-        for (int j = 0; j < conductance_deltas->nnz; j++) {
+        for (int j = 0; j < (int)conductance_deltas->nnz; j++) {
             // triplet pointers
             size_t irow = (size_t) Ci[j];
             size_t icol = (size_t) Cj[j];
@@ -867,8 +839,11 @@ int solver_iterate_ac
 
     // free the memory used by the update triplet
     cholmod_free_triplet(&conductance_deltas, state->common);
+    cholmod_free_dense(&v, state->common);
+    cholmod_free_sparse(&U, state->common);
+    cholmod_free_sparse(&D, state->common);
 
-    solver_destroy_state(state);
+    return 0;
 }
 
 
@@ -987,13 +962,15 @@ void testcase_1(size_t iter)
 
         cholmod_solve2(CHOLMOD_A, state->LD, state->b, state->b_set, &state->x,
                        &state->x_set, &state->y, &state->e, state->common);
+
+        // print the voltages we just calculated
         print_column_vector(state, state->x, "x vector");
     }
 
     solver_destroy_state(state);
 }
 
-int main ()
-{
-    testcase_0();
-}
+// int main ()
+// {
+//     testcase_0();
+// }
