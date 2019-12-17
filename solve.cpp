@@ -51,6 +51,8 @@ void solver_destroy_state(solver_state_t* state)
     if (state->is_output) delete state->is_output;
     if (state->group_to_mat_map) delete state->group_to_mat_map;
     if (state->mat_to_group_map) delete state->mat_to_group_map;
+    if (state->group_to_g_map) delete state->group_to_g_map;
+    if (state->g_to_group_map) delete state->g_to_group_map;
     if (state->A) cholmod_free_sparse(&state->A, state->common);
     if (state->LD) cholmod_free_factor(&state->LD, state->common);
     if (state->G) cholmod_free_sparse(&state->G, state->common);
@@ -203,6 +205,19 @@ void print_column_vector(solver_state_t *state, cholmod_dense *d, const char* na
     double *dx = (double*)(d->x);
     for (size_t j = 0; j < d->nrow; j++) {
         std::cout << dx[j] << ' ';
+    }
+    std::cout << "\n" << std::endl;
+}
+
+// TODO: merge group and known
+void print_group_voltages(solver_state_t* state, solver_vector_t* d, const char* name)
+{
+    std::cout << name << std::endl;
+    assert(d->nrow == state->n_input_groups);
+    cholmod_print_dense(d, NULL, state->common);
+    double *dx = (double*)(d->x);
+    for (size_t j = 0; j < state->n_input_groups; j++) {
+        std::cout << state->g_to_group_map[j] << ": " << dx[j] << ' ';
     }
     std::cout << "\n" << std::endl;
 }
@@ -385,6 +400,7 @@ int solver_initalise_network
     state->group_to_mat_map = new size_t[n_groups];
     state->mat_to_group_map = new size_t[n_mat];
     state->group_to_g_map = new size_t[n_groups];
+    state->g_to_group_map = new size_t[n_input_groups];
 
     size_t ig = 0;  // current group index
     i = 0;  // current A matrix index
@@ -394,6 +410,7 @@ int solver_initalise_network
             // mark as input group
             state->group_to_mat_map[ig] = -1;
             state->group_to_g_map[ig] = j;
+            state->g_to_group_map[j] = ig;
             j++;
         } else {
             // create group mapping from group index to matrix index and visa versa
@@ -518,6 +535,9 @@ int solver_initalise_network
         }
     }
     b_set_p[1] = i;  // nnz
+    
+    // DEBUG
+    std::cout << "Built" << std::endl;
 
     return 0;
 }
@@ -552,6 +572,9 @@ int solver_begin(solver_state_t *state)
     // eg the y = L\b step etc
     state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
     state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
+
+    // DEBUG
+    std::cout << "Begin" << std::endl;
 
     return 0;
 }
@@ -631,8 +654,17 @@ int solver_iterate_ac
     solver_triplet_t* connections,
     const int* input_groups,
     const size_t n_input_groups,
+
+    // A buffer (on the heap) where the known voltage values are stored. these
+    // can be updated each iteration. Assuming input_groups is ordered, the ith
+    // index of input_voltage_buf corresponds to the group index at the ith position
+    // in input_groups
+    double *input_voltage_buf,
     const int* output_groups,
     const size_t n_outputs,
+
+    // Called every iteration. This is your chance to read the calculated voltages
+    // of all groups, set new input voltages, and update the conductance network.
     update_func_t update_func,
     void* data
 )
@@ -664,7 +696,8 @@ int solver_iterate_ac
 
     // populate fixed voltages
     cholmod_dense *v = cholmod_ones(n_input_groups, 1, CHOLMOD_REAL, state->common);
-    // delete (double*)(v->x); v->x = (void*)input_groups;  // replace data array for matrix
+    delete (double*)(v->x);
+    v->x = (void*)input_voltage_buf;  // sneakily replace data array for matrix
 
     // allocate space for update matrices
     // An update matrix is such that A + UU^T = new A
@@ -692,9 +725,10 @@ int solver_iterate_ac
     bool should_recompute_LD = true;  // recompute LD from A
 
     // triplet for updating each iteration
-    cholmod_triplet *conductance_deltas;
-    cholmod_allocate_triplet(n_groups, n_groups, state->nnz, LOWER_TRIANGULAR,
+    cholmod_triplet *conductance_deltas = NULL;
+    conductance_deltas = cholmod_allocate_triplet(n_groups, n_groups, state->nnz, LOWER_TRIANGULAR,
                              CHOLMOD_REAL, state->common);
+
 
     for (size_t i = 0; i < n_iters; i++) {
         if (should_recompute_LD) {
@@ -715,19 +749,12 @@ int solver_iterate_ac
         // don't do any calculations if not
         // assume triplet is lower triangular
         // triplet doesn't need to be sorted
+        
         conductance_deltas->nnz = 0;  // reset size (overwrite)
 
         // passed in update function
         // fills out the conductance_deltas triplet and gives us a voltage vector
-        double *voltages = (double*)(v->x);
-        int code = update_func(state, conductance_deltas, &voltages, i, data);
-        if (voltages != (double*)(v->x)) {
-            // we changed this to point to new data
-            // we must free the data origonally allocated
-            // the new data pointed to will be freed at the end of this call
-            delete (double*)(v->x);
-            v->x = (void*) voltages;
-        }
+        int code = update_func(state, conductance_deltas, i, data);
         
         if (code < 0) {
             std::cerr << "Update failed with code " << code << std::endl;
@@ -743,11 +770,6 @@ int solver_iterate_ac
                             "xtype:%d\n",
                     conductance_deltas->ncol, conductance_deltas->nrow,
                     conductance_deltas->stype, conductance_deltas->xtype);
-            return -1;
-        }
-
-        if (conductance_deltas->ncol != state->n_mat) {
-            std::cerr << "Update triplet must have dimensions n_mat (n_groups - n_inputs).\n";
             return -1;
         }
 

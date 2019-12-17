@@ -4,7 +4,7 @@
 #include "cholmod.h"
 #include <stdbool.h>
 
-#ifndef __cplusplus
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -13,7 +13,9 @@ extern "C" {
 #define DECOMPOSITION_FREQUENCY 1000
 
 // triplet used to supply connection data
+// rename so that it's obvious these types belong to this module
 typedef cholmod_triplet solver_triplet_t;
+typedef cholmod_dense solver_vector_t;
 
 typedef struct {
     cholmod_common *common;
@@ -30,6 +32,7 @@ typedef struct {
     size_t *group_to_mat_map;  // mapping from group index to A matrix index
     size_t *mat_to_group_map;  // mapping from A matrix index to group index
     size_t *group_to_g_map;  // mapping from group index to G matrix index
+    size_t *g_to_group_map;  // mapping from G matrix (input voltage) to group.
     size_t n_mat;  // matrix size (should be n_groups - n_input_groups) size(A)
 
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
@@ -51,6 +54,7 @@ typedef struct {
 void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name);
 #define TRIPLET_DEBUG_LIMIT ((size_t) 10)
 void print_triplet(solver_state_t* state, solver_triplet_t* triplet, const char* name);
+void print_group_voltages(solver_state_t* state, solver_vector_t* v, const char* name);
 
 /**
  * Three-way insertion sort for sorting triplets by column then row.
@@ -146,21 +150,44 @@ int solver_initalise_network
 void solver_destroy_state(solver_state_t* state);
 
 // pointer to update function
-typedef int (*update_func_t)(solver_state_t*, solver_triplet_t*, double**, int i, void* data);
+// put anything you want in data, it is passed from a call to solver_iterate_ac
+// the triplet must be appended to with the connections you wish to update
+// i is the iteration index, starting from 0
+typedef int (*update_func_t)(solver_state_t*, solver_triplet_t*, int i, void* data);
 
 /**
  * Solve a system where the input voltages can vary with time.
  * */
 int solver_iterate_ac
 (
-    solver_state_t *state,
-    const size_t n_iters,
+    solver_state_t *state,  // state object to pass in
+    const size_t n_iters,  // number of solves to do (calls update_func n_iter times)
+
+    // A triplet describing the conductance network. It must be in lower triangular
+    // symmetric form. Preferably sorted by column then by row. Thus, each
+    // connection only apears once. See some of the examples on how to do this,
+    // or just load from a .mtx file
     solver_triplet_t* connections,
+
+    // The indices, in sorted ofter, of the groups which are inputs, ie we know
+    // their voltage
     const int* input_groups,
     const size_t n_input_groups,
+
+    // A buffer (on the heap) where the known voltage values are stored. these
+    // can be updated each iteration. Assuming input_groups is ordered, the ith
+    // index of input_voltage_buf corresponds to the group index at the ith position
+    // in input_groups
+    double *input_voltage_buf,  // must be allocated and of length n_outputs
     const int* output_groups,
     const size_t n_outputs,
+
+    // Called every iteration. This is your chance to read the calculated voltages
+    // of all groups, set new input voltages, and update the conductance network.
     update_func_t update_func,
+
+    // Can be anything you want to pass to the update function so you don't have
+    // to use globals.
     void* data
 );
 
@@ -175,7 +202,7 @@ cholmod_triplet* triplet_from_file
     const char* filename
 );
 
-#ifndef __cplusplus
+#ifdef __cplusplus
 }
 #endif
 #endif

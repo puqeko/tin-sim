@@ -2,14 +2,15 @@
 
 static double *known_voltages;
 
-int network_update(solver_state_t* state, solver_triplet_t* triplet,
-                   double** voltages, int iter, void* data)
+int network_update(solver_state_t* state, solver_triplet_t* triplet, int iter, void* data)
 {
-    // change voltages pointer to point to our known voltages (fixed voltages)
-    // alternativly, we could write new voltages each iter to (*voltages)[i] = vi
-    // these voltages are in index order, corrisponding to the input_groups passed
-    // in at startup. Ie, the ith value in *voltages is the ith group in input_groups.
-    *voltages = known_voltages;
+    // Process calculated group voltages
+    print_group_voltages(state->x);
+
+    // --------------------------------------
+    // Prep for next iteration
+
+    // would be a good place to set our voltages here, if they change with time
     printf("Iter: %d\n", iter);
 
     // Build a triplet, which will update the conductance of some connections.
@@ -61,8 +62,8 @@ int main (void)
     const int n_iters = 1;  // change this to the number of iterations
     
     solver_iterate_ac(
-        state, n_iters, triplet, input_groups, n_inputs, output_groups, n_ouputs,
-        network_update, NULL
+        state, n_iters, triplet, input_groups, n_inputs, known_voltages,
+        output_groups, n_ouputs, network_update, NULL
     );
     solver_destroy_state(state);
     return 0;
