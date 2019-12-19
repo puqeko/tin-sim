@@ -209,17 +209,30 @@ void print_column_vector(solver_state_t *state, cholmod_dense *d, const char* na
     std::cout << "\n" << std::endl;
 }
 
-// TODO: merge group and known
-void print_group_voltages(solver_state_t* state, solver_vector_t* d, const char* name)
+// Merge group and known voltages and print them
+// by the group index if they are outputs
+void print_output_voltages(solver_state_t* state)
 {
-    std::cout << name << std::endl;
-    assert(d->nrow == state->n_input_groups);
-    cholmod_print_dense(d, NULL, state->common);
-    double *dx = (double*)(d->x);
-    for (size_t j = 0; j < state->n_input_groups; j++) {
-        std::cout << state->g_to_group_map[j] << ": " << dx[j] << ' ';
+    std::cout << "\nGroup Index: Voltage\n";
+    
+    double *xx = (double*)(state->x->x);
+    double *vx = (double*)(state->v->x);
+    int i = 0;
+    int j = 0;
+    for (size_t ig = 0; ig < state->n_groups; ig++) {
+        if (state->is_input[ig]) {
+            if (state->is_output) {
+                std::cout << ig << ": " << vx[i] << '\n';
+            }
+            i++;
+        } else {
+            if (state->is_output) {
+                 std::cout << ig << ": " << xx[j] << '\n';
+            }
+            j++;
+        }
     }
-    std::cout << "\n" << std::endl;
+    std::cout << std::endl;
 }
 
 /**
@@ -389,8 +402,8 @@ int solver_initalise_network
         }
     }
 
-    print_adj(adj_c, "Column wise adjacancy:");
-    print_adj(adj_r, "Row wise adjacancy:");
+    // print_adj(adj_c, "Column wise adjacancy:");
+    // print_adj(adj_r, "Row wise adjacancy:");
 
     // A matrix size
     size_t n_mat = n_groups - n_input_groups;
@@ -399,6 +412,8 @@ int solver_initalise_network
     // map from group index to matrix index
     state->group_to_mat_map = new size_t[n_groups];
     state->mat_to_group_map = new size_t[n_mat];
+
+    // matrix of inputs (rows of G matrix)
     state->group_to_g_map = new size_t[n_groups];
     state->g_to_group_map = new size_t[n_input_groups];
 
@@ -535,9 +550,6 @@ int solver_initalise_network
         }
     }
     b_set_p[1] = i;  // nnz
-    
-    // DEBUG
-    std::cout << "Built" << std::endl;
 
     return 0;
 }
@@ -573,14 +585,11 @@ int solver_begin(solver_state_t *state)
     state->y = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
     state->e = cholmod_allocate_dense(n_mat, 1, n_mat, CHOLMOD_REAL, state->common);
 
-    // DEBUG
-    std::cout << "Begin" << std::endl;
-
     return 0;
 }
 
 // lookup time is O(log n) where n is the number of non-zeros in the cth column
-int _update_mat(cholmod_sparse* A, size_t& r, size_t& c, double& dg)
+int _update_A_mat(cholmod_sparse* A, size_t& r, size_t& c, double& dg)
 {
     if (c >= A->ncol || r >= A->nrow) {
         return -1;  // the row/col is outside A
@@ -601,7 +610,40 @@ int _update_mat(cholmod_sparse* A, size_t& r, size_t& c, double& dg)
         return -2;  // the row/col is non-zero, which can't be updated
     }
     // update the matrix entry with a change in conductance
-    Ax[index] += dg;
+    Ax[index] -= dg;  // since these are stored as -ve values on the offdiagonals
+
+    // the diagonal entry is the first entry in a symmetric matrix so do this
+    // for the A matrix but not G
+    Ax[Ap[c]] += dg;
+
+    // do this for the row also since this entry is transposed
+    Ax[Ap[r]] += dg;
+    return 0;
+}
+
+// lookup time is O(log n) where n is the number of non-zeros in the cth column
+int _update_G_mat(cholmod_sparse* G, size_t& r, size_t& c, double& dg)
+{
+    if (c >= G->ncol || r >= G->nrow) {
+        return -1;  // the row/col is outside A
+    }
+
+    // get sparse pointers to A matrix
+    int *Gp = (int*)(G->p);
+    int *Gi = (int*)(G->i);
+    double *Gx = (double*)(G->x);
+
+    // get pointers to the columns start and end in the i and x arrays
+    int *rstart = &Gi[Gp[c]];  // inclusive
+    int *rend = &Gi[Gp[c+1]];  // exclusive
+    // do a binary search on this column
+    int *i = std::lower_bound(rstart, rend, r);
+    int index = i-Gi;  // index of the conductance value in i and x
+    if (index >= Gp[c+1] || index < Gp[c] || *i != (int)r) {
+        return -2;  // the row/col is non-zero, which can't be updated
+    }
+    // update the matrix entry with a change in conductance
+    Gx[index] += dg;
     return 0;
 }
 
@@ -696,6 +738,7 @@ int solver_iterate_ac
 
     // populate fixed voltages
     cholmod_dense *v = cholmod_ones(n_input_groups, 1, CHOLMOD_REAL, state->common);
+    state->v = v;
     delete (double*)(v->x);
     v->x = (void*)input_voltage_buf;  // sneakily replace data array for matrix
 
@@ -816,8 +859,23 @@ int solver_iterate_ac
             // recompute b
             int res;
             if (state->is_input[icol]) {
+                if (state->is_input[irow]) continue;
+
                 // update a G sparse matrix value where G is n_mat * n_input_groups
-                res = _update_mat(state->G, state->group_to_mat_map[irow], state->group_to_g_map[icol], dg);
+                res = _update_G_mat(state->G, state->group_to_mat_map[irow], state->group_to_g_map[icol], dg);
+                
+                // if we can't find a value in the sparse matrix to update
+                if (res < 0) {
+                    std::cout << "Cannot update zero values in G matrix." << std::endl;
+                    return -1;
+                }
+            } else if (state->is_input[irow]) {
+                if (state->is_input[icol]) continue;
+                std::swap(irow, icol);
+
+                // update a G sparse matrix value where G is n_mat * n_input_groups
+                res = _update_G_mat(state->G, state->group_to_mat_map[irow], state->group_to_g_map[icol], dg);
+                
                 // if we can't find a value in the sparse matrix to update
                 if (res < 0) {
                     std::cout << "Cannot update zero values in G matrix." << std::endl;
@@ -825,7 +883,7 @@ int solver_iterate_ac
                 }
             } else {
                 // update a A sparse matrix value where A is n_mat * n_mat
-                res = _update_mat(state->A, state->group_to_mat_map[irow], state->group_to_mat_map[icol], dg);
+                res = _update_A_mat(state->A, state->group_to_mat_map[irow], state->group_to_mat_map[icol], dg);
 
                 // if we can't find a value in the sparse matrix to update
                 if (res < 0) {

@@ -10,7 +10,8 @@ extern "C" {
 
 // Every DECOMPOSITION_FREQUENCY iterations, we recalculate the LDL decomposition
 // from the A matrix.
-#define DECOMPOSITION_FREQUENCY 1000
+// This option is incase we loose precision overtime
+#define DECOMPOSITION_FREQUENCY 10000000
 
 // triplet used to supply connection data
 // rename so that it's obvious these types belong to this module
@@ -31,8 +32,8 @@ typedef struct {
     // since the matrix doesn't contain input groups (knowns), we need mappings
     size_t *group_to_mat_map;  // mapping from group index to A matrix index
     size_t *mat_to_group_map;  // mapping from A matrix index to group index
-    size_t *group_to_g_map;  // mapping from group index to G matrix index
-    size_t *g_to_group_map;  // mapping from G matrix (input voltage) to group.
+    size_t *group_to_g_map;  // mapping from group index to G matrix row index
+    size_t *g_to_group_map;  // mapping from G matrix rows (inputs) to group.
     size_t n_mat;  // matrix size (should be n_groups - n_input_groups) size(A)
 
     // stuff needed to solve Ax = b, were x [volts] and b [amps] are vectors
@@ -43,6 +44,7 @@ typedef struct {
     cholmod_sparse *b_set;  // pattern of groups which have injected currents
     cholmod_dense *x;  // vector of solved voltages
     cholmod_sparse *x_set;  // pattern of groups voltages with defined solutions
+    cholmod_dense *v;  // known voltage vector
 
     // vectors of length N, if A is NxN, which are allocated for intermediate
     // steps in the solve process and reused by the cholmod api
@@ -54,7 +56,7 @@ typedef struct {
 void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name);
 #define TRIPLET_DEBUG_LIMIT ((size_t) 10)
 void print_triplet(solver_state_t* state, solver_triplet_t* triplet, const char* name);
-void print_group_voltages(solver_state_t* state, solver_vector_t* v, const char* name);
+void print_output_voltages(solver_state_t* state);
 
 /**
  * Three-way insertion sort for sorting triplets by column then row.

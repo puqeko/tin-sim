@@ -11,10 +11,10 @@ CC = gcc-9 -std=c11 -Wall -O2  # use C11
 FLAGS = -I$(SSPATH)/include -L$(SSPATH)/lib -lcholmod -lsuitesparseconfig -lm
 
 # make object file
-solve.o: solve.cpp
+solve.o: solve.cpp solve.h
 	$(Cpp) -o solve.o -c solve.cpp $(FLAGS)
 
-example.o: solve.o
+example.o: solve.o example.c solve.h
 	$(CC) -o example.o solve.o example.c $(FLAGS) -lstdc++
 
 clean:

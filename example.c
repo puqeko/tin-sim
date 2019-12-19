@@ -4,15 +4,21 @@ static double *known_voltages;
 
 int network_update(solver_state_t* state, solver_triplet_t* triplet, int iter, void* data)
 {
-    // Process calculated group voltages
-    print_group_voltages(state->x);
+    // See calculated group voltages for iteration n
+    printf("Iter: %d\n", iter);
+    print_output_voltages(state);
+
+    // printf("Matricies used:\n");
+    // print_sparse(state, state->A, "A");
+    // print_sparse(state, state->G, "G");
+    // print_sparse(state, state->b_set, "b_set");
 
     // --------------------------------------
     // Prep for next iteration
 
-    // would be a good place to set our voltages here, if they change with time
-    printf("Iter: %d\n", iter);
-
+    // would be a good place to set our voltages for the next iteration here,
+    // if they change with time
+    
     // Build a triplet, which will update the conductance of some connections.
     // These conductances must be deltas.
     // We are only going to change one link in this example.
@@ -28,7 +34,7 @@ int network_update(solver_state_t* state, solver_triplet_t* triplet, int iter, v
     Trow[0] = 3;
     Tcol[0] = 0;
     // alternate between adding and removing 0.1 to conductance of connection from 0 to 3
-    Tcond[0] = (iter%2==0) ? +0.1 : -0.1;
+    Tcond[0] = (iter%2==0) ? +1.0/3.0 : -1.0/3.0;
     triplet->nnz = 1;  // specify that we have 1 update in the triplet
 
     // add another update as such
@@ -59,7 +65,7 @@ int main (void)
     int input_groups[] = {1, 2}; int n_inputs = 2;  // set v_1 and v_2 as known
     int output_groups[] = {0, 1, 2, 3}; int n_ouputs = 4;  // get all voltages
 
-    const int n_iters = 1;  // change this to the number of iterations
+    const int n_iters = 2;  // change this to the number of iterations
     
     solver_iterate_ac(
         state, n_iters, triplet, input_groups, n_inputs, known_voltages,
