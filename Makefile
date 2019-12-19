@@ -1,4 +1,4 @@
-default: example.o
+default: example.o make_symmetric.o
 
 # Must set SSPATH=path/to/SuiteSparse-X.X.X/
 include $(SSPATH)/SuiteSparse_config/SuiteSparse_config.mk
@@ -16,6 +16,9 @@ solve.o: solve.cpp solve.h
 
 example.o: solve.o example.c solve.h
 	$(CC) -o example.o solve.o example.c $(FLAGS) -lstdc++
+
+make_symmetric.o: make_symmetric.cpp
+	$(Cpp) -o make_symmetric.o make_symmetric.cpp $(FLAGS)
 
 clean:
 	rm *.o *.so *.out
