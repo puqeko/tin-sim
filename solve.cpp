@@ -1,4 +1,13 @@
-/* solve.cpp */
+/** 
+ * solve.cpp
+ * 
+ * Created 27-11-19 by Thomas Morrison
+ * 
+ * Use Cholesky updates to compute group voltages for a percolating network of
+ * tin particles where the conductance of some connections may change every
+ * iteration.
+ * 
+ */
 
 extern "C" {
     #include <cholmod.h>
@@ -180,15 +189,20 @@ void print_sparse(solver_state_t *state, cholmod_sparse *A, const char* name)
     // print info about matrix
     cholmod_print_sparse(A, NULL, state->common);
     size_t nnz = cholmod_nnz(A, state->common);
-    // print values
+
+    // print pointers
     for (size_t i = 0; i < A->ncol+1; i++) {
         printf("%d ", ((int*)A->p)[i]);
     }
     printf("\n");
+
+    // print row indices
     for (size_t i = 0; i < nnz; i++) {
         printf("%d ", ((int*)A->i)[i]);
     }
     printf("\n");
+
+    // print values at indices
     if (A->xtype == CHOLMOD_REAL) {
         for (size_t i = 0; i < nnz; i++) {
             printf("%f ", ((double*)A->x)[i]);

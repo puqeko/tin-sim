@@ -1,3 +1,12 @@
+/**
+ * example.c
+ * 
+ * Created 14-12-19 by Thomas Morrison
+ * 
+ * Example use case for solve.cpp. See the README for expected output.
+ * 
+ */
+
 #include "solve.h"
 
 static double *known_voltages;

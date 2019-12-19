@@ -1,4 +1,7 @@
-/* make_symmetric.cpp
+/**
+ * make_symmetric.cpp
+ * 
+ * Created 20-11-19 by Thomas Morrison
  * 
  * Checks to see if a matrix, given in .mtx format to stdin, is stored as a
  * symmetric matrix in lower triangular form. If it is not, check if we can
@@ -9,6 +12,7 @@
  * 
  * example use: convert the simple.mtx file to symmetric format
  * ./make_symmetric.o < matrices/simple.mtx > out.mtx
+ * 
  */
 
 #include <iostream>
