@@ -725,6 +725,7 @@ int solver_iterate_ac
     void* data
 )
 {
+    int retval = 0;
     size_t n_groups = connections->nrow;
     assert(n_input_groups <= n_groups);
     assert(n_outputs <= n_groups);
@@ -788,9 +789,17 @@ int solver_iterate_ac
 
 
     for (size_t i = 0; i < n_iters; i++) {
+
         if (should_recompute_LD) {
             // get actual factorisation for LDLT
             cholmod_factorize(state->A, state->LD, state->common);
+            if (state->common->status == CHOLMOD_NOT_POSDEF) {
+                std::cout << "The matrix is not positive definite. It is likley "
+                "that either you have input a -ve conductance or the network is "
+                "disconnected." << std::endl;
+                retval = -1;
+                goto failure;
+            }
             should_recompute_LD = false;
         }
 
@@ -815,7 +824,8 @@ int solver_iterate_ac
         
         if (code < 0) {
             std::cerr << "Update failed with code " << code << std::endl;
-            return -1;
+            retval = -1;
+            goto failure;
         }
 
         // make some assertions about symmetry, type, etc of triplet
@@ -827,7 +837,8 @@ int solver_iterate_ac
                             "xtype:%d\n",
                     conductance_deltas->ncol, conductance_deltas->nrow,
                     conductance_deltas->stype, conductance_deltas->xtype);
-            return -1;
+            retval = -1;
+            goto failure;
         }
 
         // decide between updating LD or making a new one
@@ -881,7 +892,8 @@ int solver_iterate_ac
                 // if we can't find a value in the sparse matrix to update
                 if (res < 0) {
                     std::cout << "Cannot update zero values in G matrix." << std::endl;
-                    return -1;
+                    retval = -1;
+                    goto failure;
                 }
             } else if (state->is_input[irow]) {
                 if (state->is_input[icol]) continue;
@@ -893,7 +905,8 @@ int solver_iterate_ac
                 // if we can't find a value in the sparse matrix to update
                 if (res < 0) {
                     std::cout << "Cannot update zero values in G matrix." << std::endl;
-                    return -1;
+                    retval = -1;
+                    goto failure;
                 }
             } else {
                 // update a A sparse matrix value where A is n_mat * n_mat
@@ -902,7 +915,8 @@ int solver_iterate_ac
                 // if we can't find a value in the sparse matrix to update
                 if (res < 0) {
                     std::cout << "Cannot update zero values in A matrix." << std::endl;
-                    return -1;
+                    retval = -1;
+                    goto failure;  
                 }
 
                 // construct the sparse matricies for updown dating LD for A
@@ -921,6 +935,7 @@ int solver_iterate_ac
                 }
             }
         }
+
         Dp[id] = id*2; D->ncol = id;  // length of sparse matrix D as last index
         Up[iu] = iu*2; U->ncol = iu;  // length of sparse matrix U as last index
 
@@ -931,13 +946,14 @@ int solver_iterate_ac
         }
     }
 
+failure:
     // free the memory used by the update triplet
     cholmod_free_triplet(&conductance_deltas, state->common);
     cholmod_free_dense(&v, state->common);
     cholmod_free_sparse(&U, state->common);
     cholmod_free_sparse(&D, state->common);
 
-    return 0;
+    return retval;
 }
 
 
