@@ -460,7 +460,7 @@ int solver_initalise_network
     // the empty matrix we are going to fill
     cholmod_sparse* G = cholmod_allocate_sparse(
         n_mat, n_input_groups, n_input_groups * n_mat, true, true,
-        LOWER_TRIANGULAR, CHOLMOD_REAL, state->common);
+        0, CHOLMOD_REAL, state->common);
 
     state->G = G;  // save a reference in state
 
