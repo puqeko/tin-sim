@@ -681,8 +681,8 @@ void _add_update_col
     // out we get dg back
     double rootdg = std::sqrt(std::abs(dg));
     Cp[i] = i*2;  // we add two datapoints for each new column
-    Ci[i*2] = state->group_to_mat_map[r];  // convert to matrix indicies
-    Ci[i*2+1] = state->group_to_mat_map[c];  // convert to matrix indicies
+    Ci[i*2] = state->group_to_mat_map[c];  // convert to matrix indicies
+    Ci[i*2+1] = state->group_to_mat_map[r];  // convert to matrix indicies
 
     // Will add a +ve dg to the diagonals and -ve dg to the off diagonals once
     // multiplied out and added to A. This corrisponds to updating the conductance
