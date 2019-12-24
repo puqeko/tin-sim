@@ -235,12 +235,12 @@ void print_output_voltages(solver_state_t* state)
     int j = 0;
     for (size_t ig = 0; ig < state->n_groups; ig++) {
         if (state->is_input[ig]) {
-            if (state->is_output) {
+            if (state->is_output[ig]) {
                 std::cout << ig << ": " << vx[i] << '\n';
             }
             i++;
         } else {
-            if (state->is_output) {
+            if (state->is_output[ig]) {
                  std::cout << ig << ": " << xx[j] << '\n';
             }
             j++;
