@@ -13,8 +13,8 @@ The solver is written in C++ but can also interface with C so that it may be use
 ## Installation
 
 * Download, compile, and install [SuiteSparse](http://faculty.cse.tamu.edu/davis/suitesparse.html). Only the CHOLMOD module is used (and its dependances).
-* Set the environment variable SSPATH="/path/to/SuiteSparse-X.X.X". You may also need to change the compiler command you are using at the `CC=..` and `CCC=` lines in the MakeFile. I used GNU gcc and g++.
-* Run `make` to compile.
+* Set the environment variable `export SSPATH=/path/to/SuiteSparse-X.X.X`. You may also need to change the compiler command you are using at the `CC=..` and `CCC=` lines in the MakeFile. I used GNU gcc and g++ 9.
+* Run `make` to compile the example.
 
 ## Usage
 Assuming all the files compiled successfully, run the example code with `make && ./example.o `. You should see the following output after the compilation info.
