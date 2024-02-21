@@ -1,8 +1,12 @@
-A fast (hopefully) incremental network solver as part of a deterministic simulation of electrical interactions between tin particles.
+# Simulate percolating network
 
-A system of groups (groups of tin particles) and the coductances between those groups is provided via .mtx format or using a triplet object. This data must be in lower triangular form. The program `make_symmetric.cpp` can be used to convert .mtx files into lower triangular form.
+A fast incremental network solver, using low rank matrix updates, as part of a deterministic simulation of electrical interactions between tin particles to investigate if they act as a hardware-based neural network.
 
-As demonstrated in `example.c`, this triplet is provided to the solver and conductance and voltage updates can be applied over a number of iterations.
+[Download the report](Low_rank_updates.pdf).
+
+A system of groups (groups of tin particles) and the conductances between those groups is provided via .mtx format or using a triplet object. This data must be in lower triangular form. The program `make_symmetric.cpp` can be used to convert .mtx files into lower triangular form.
+
+As demonstrated in `example.c`, this triplet is provided to the solver and conductance and voltage updates can be applied over a number ofg iterations.
 
 The solver works by first computing the Cholesky decomposition of the system then solving for the voltage at every group. For each iteration, conductances can be updated. The decomposition is then updated without recomputing from the system matrix.
 

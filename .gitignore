@@ -4,3 +4,4 @@ matrices/*
 *.out
 *.o
 .vscode/
+.DS_Store
